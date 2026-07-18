@@ -49,6 +49,11 @@ storage/
   append-000001.segment
 ```
 
+Segment file names are parsed into internal segment names with a segment kind
+and non-zero numeric segment ID. The active segment is still fixed to
+`append-000001.segment`; later rotation work should change active segment
+selection without changing record replay logic.
+
 The public API exposes per-node storage operations:
 
 - open a node storage handle

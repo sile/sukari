@@ -14,7 +14,8 @@ const SEGMENT_FORMAT_MAGIC: &[u8; 4] = b"SKR1";
 const SEGMENT_BASE_HEADER_LEN: usize = 8;
 const SEGMENT_CHECKSUM_LEN: usize = 4;
 const SEGMENT_HEADER_LEN: usize = SEGMENT_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
-const ACTIVE_SEGMENT_FILE_NAME: &str = "append-000001.segment";
+const SEGMENT_FILE_SUFFIX: &str = ".segment";
+const SEGMENT_ID_WIDTH: usize = 6;
 const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
 
@@ -45,6 +46,7 @@ pub enum SyncPolicy {
 pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
+    active_segment: SegmentName,
 }
 
 impl StorageEngine {
@@ -52,13 +54,17 @@ impl StorageEngine {
     pub fn new<P: AsRef<Path>>(dir: P, sync: SyncPolicy) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir, sync)?;
-        Ok(Self { dir, sync })
+        Ok(Self {
+            dir,
+            sync,
+            active_segment: SegmentName::first_append(),
+        })
     }
 
     /// Opens storage for the given Raft node.
     pub fn open(&self, node_id: noraft::NodeId) -> io::Result<NodeStorage> {
         create_dir_all_synced(&self.dir, self.sync)?;
-        let replay = replay_storage_dir(&self.dir)?;
+        let replay = replay_storage_dir(&self.dir, self.active_segment)?;
         if replay.removed_nodes.contains(&node_id) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -66,7 +72,7 @@ impl StorageEngine {
             ));
         }
 
-        let segment_path = active_segment_path(&self.dir);
+        let segment_path = self.active_segment.path(&self.dir);
         let file_existed = segment_path.exists();
         let mut file = open_active_segment_file(&segment_path)?;
         if !file_existed && should_sync_metadata(self.sync) {
@@ -86,7 +92,7 @@ impl StorageEngine {
 
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
-        replay_storage_dir(&self.dir).map(|replay| replay.nodes)
+        replay_storage_dir(&self.dir, self.active_segment).map(|replay| replay.nodes)
     }
 
     /// Records removal of all durable data for the given Raft node.
@@ -95,7 +101,7 @@ impl StorageEngine {
     /// before calling this method.
     pub fn remove_node(&self, node_id: noraft::NodeId) -> io::Result<()> {
         create_dir_all_synced(&self.dir, self.sync)?;
-        let segment_path = active_segment_path(&self.dir);
+        let segment_path = self.active_segment.path(&self.dir);
         let file_existed = segment_path.exists();
         let mut file = open_active_segment_file(&segment_path)?;
         if !file_existed && should_sync_metadata(self.sync) {
@@ -398,6 +404,91 @@ struct NodeRecord {
     record: Record,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SegmentId(u64);
+
+impl SegmentId {
+    const FIRST: Self = Self(1);
+
+    fn new(id: u64) -> Option<Self> {
+        (id != 0).then_some(Self(id))
+    }
+
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SegmentKind {
+    Append,
+    Rewrite,
+}
+
+impl SegmentKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Rewrite => "rewrite",
+        }
+    }
+
+    fn parse_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "append" => Some(Self::Append),
+            "rewrite" => Some(Self::Rewrite),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SegmentName {
+    kind: SegmentKind,
+    id: SegmentId,
+}
+
+impl SegmentName {
+    fn first_append() -> Self {
+        Self {
+            kind: SegmentKind::Append,
+            id: SegmentId::FIRST,
+        }
+    }
+
+    fn parse_file_name(file_name: &OsStr) -> Option<Self> {
+        let file_name = file_name.to_str()?;
+        let name = file_name.strip_suffix(SEGMENT_FILE_SUFFIX)?;
+        let (prefix, id) = name.split_once('-')?;
+        let kind = SegmentKind::parse_prefix(prefix)?;
+        if id.len() != SEGMENT_ID_WIDTH || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let id = id.parse().ok().and_then(SegmentId::new)?;
+        Some(Self { kind, id })
+    }
+
+    fn path(self, dir: &Path) -> PathBuf {
+        dir.join(self.file_name())
+    }
+
+    fn file_name(self) -> String {
+        format!(
+            "{}-{:0width$}{}",
+            self.kind.prefix(),
+            self.id.get(),
+            SEGMENT_FILE_SUFFIX,
+            width = SEGMENT_ID_WIDTH
+        )
+    }
+}
+
+#[derive(Debug)]
+struct SegmentPath {
+    name: SegmentName,
+    path: PathBuf,
+}
+
 #[derive(Debug, Default)]
 struct ReplayState {
     nodes: BTreeMap<noraft::NodeId, StorageState>,
@@ -437,17 +528,16 @@ fn apply_record_to_state(state: &mut StorageState, record: &Record) -> io::Resul
     }
 }
 
-fn replay_storage_dir(dir: &Path) -> io::Result<ReplayState> {
+fn replay_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<ReplayState> {
     let mut replay = ReplayState::default();
-    let active_path = active_segment_path(dir);
-    for path in discover_segment_paths(dir)? {
-        let allow_partial = path == active_path;
-        replay_segment(&path, allow_partial, &mut replay)?;
+    for segment in discover_segment_paths(dir)? {
+        let allow_partial = segment.name == active_segment;
+        replay_segment(&segment.path, allow_partial, &mut replay)?;
     }
     Ok(replay)
 }
 
-fn discover_segment_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -460,19 +550,16 @@ fn discover_segment_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
         if !entry.file_type()?.is_file() {
             continue;
         }
-        if is_segment_file_name(&entry.file_name()) {
-            paths.push(entry.path());
-        }
+        let Some(name) = SegmentName::parse_file_name(&entry.file_name()) else {
+            continue;
+        };
+        paths.push(SegmentPath {
+            name,
+            path: entry.path(),
+        });
     }
-    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    paths.sort_by_key(|segment| segment.name);
     Ok(paths)
-}
-
-fn is_segment_file_name(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    name.ends_with(".segment") && (name.starts_with("append-") || name.starts_with("rewrite-"))
 }
 
 fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) -> io::Result<()> {
@@ -496,10 +583,6 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
     }
 
     Ok(())
-}
-
-fn active_segment_path(dir: &Path) -> PathBuf {
-    dir.join(ACTIVE_SEGMENT_FILE_NAME)
 }
 
 fn open_active_segment_file(path: &Path) -> io::Result<File> {
