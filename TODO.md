@@ -8,27 +8,23 @@
 
 ## Storage API
 
-- Define the public storage engine API around per-node operations compatible
-  with `noraft`-based runtimes.
 - Decide whether loaded command and snapshot payloads should stay as `Vec<u8>`
   wrappers or move to a shared representation.
-- Define node removal semantics and tombstone visibility during replay.
+- Revisit node tombstone behavior after the first runtime integration.
+- Decide whether `load_all()` should expose removed node IDs to callers.
 
 ## Segment Format
 
-- Choose the first segment magic value.
-- Define record headers, record kinds, and checksum coverage.
-- Add bounded binary encoding and decoding.
-- Reject unknown magic values, unknown record kinds, oversized records, and
-  malformed payloads clearly.
+- Document the `SKR1` format once the first release boundary is clear.
+- Add segment rotation and active segment selection.
+- Define manifest format and whether it is authoritative or advisory.
+- Define rewrite segment ordering and completion records.
 
 ## Replay
 
-- Implement deterministic segment discovery.
-- Rebuild per-node hard state, log entries, command payload maps, and snapshot
-  metadata from append and rewrite segments.
-- Truncate trailing partial records in the active segment.
-- Treat checksum mismatch as corruption.
+- Validate replay behavior when both append and rewrite segments exist.
+- Add manifest-assisted replay once the manifest format exists.
+- Decide whether inactive segments should ever tolerate trailing partial records.
 
 ## Compaction And Garbage Collection
 

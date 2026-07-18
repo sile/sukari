@@ -39,12 +39,51 @@ The standard architecture treats `noraft::NodeId` values as globally unique.
 `sukari` should therefore route records by node ID. Cluster and group metadata
 should stay in the control plane above the storage layer.
 
-## Initial Baseline
+## Current Baseline
 
-The initial codebase defines the shared state model and crate boundary only.
-It does not yet implement segment files, manifests, compaction, or recovery.
+The current implementation provides a conservative append-only baseline with one
+active shared segment:
 
-The first implementation target is a conservative append-only design:
+```text
+storage/
+  append-000001.segment
+```
+
+The public API exposes per-node storage operations:
+
+- open a node storage handle
+- save current term
+- save voted-for node
+- append log entries and command payloads
+- save snapshot state
+- flush pending writes
+- load all non-removed node states
+- record a node removal tombstone
+- remove all storage data
+
+Each segment record uses the `SKR1` frame format:
+
+- magic
+- body length
+- CRC-32C checksum of the body
+- node ID
+- record kind
+- encoded payload
+
+The current record kinds are:
+
+- current term
+- voted-for node
+- log append
+- snapshot
+- node removal tombstone
+
+`SKR1` is unstable while the crate is unreleased. Incompatible storage changes
+can still move to a new magic value if keeping experimental data is not useful.
+
+## Future Layout
+
+The intended full design is a shared segmented append-only design:
 
 ```text
 storage/
@@ -54,22 +93,10 @@ storage/
   rewrite-000010.segment
 ```
 
-Each record should carry enough metadata to replay state without consulting a
-random-read index:
-
-- magic
-- record length
-- checksum
-- node ID
-- record kind
-- log position or range
-- payload length
-- payload
-
 ## Replay
 
-Startup should discover segment files, replay them in deterministic order, and
-rebuild per-node state:
+Startup discovers `append-*.segment` and `rewrite-*.segment` files, replays them
+in deterministic file-name order, and rebuilds per-node state:
 
 - current term
 - voted-for node
@@ -81,6 +108,9 @@ rebuild per-node state:
 The first version should not require an on-disk random-read index. Normal reads
 are expected to be rare and mostly limited to startup. If replay becomes too
 slow, a manifest or hint file can be added later as an accelerator.
+
+The active segment tolerates a trailing partial record and truncates it during
+replay. Checksum mismatches are treated as corruption.
 
 ## Compaction And Garbage Collection
 
