@@ -54,9 +54,10 @@ and non-zero numeric segment ID. The active segment is still fixed to
 `append-000001.segment`; later rotation work should change active segment
 selection without changing record replay logic.
 
-The public API exposes per-node storage operations:
+The public API exposes node ID based storage operations on a single engine
+writer:
 
-- open a node storage handle
+- load a node state
 - save current term
 - save voted-for node
 - append log entries and command payloads
@@ -65,6 +66,10 @@ The public API exposes per-node storage operations:
 - load all non-removed node states
 - record a node removal tombstone
 - remove all storage data
+
+`sukari` does not add internal mutexes around writes. Callers that need
+concurrent runtime integration should own serialization outside this crate, for
+example by routing storage requests through a dedicated storage task.
 
 Each segment record uses the `SKR1` frame format:
 

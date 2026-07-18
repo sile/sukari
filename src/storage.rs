@@ -28,7 +28,7 @@ pub enum SyncPolicy {
     /// Synchronize durable data after record or byte thresholds are reached.
     ///
     /// A zero threshold is ignored. If both thresholds are zero, writes are
-    /// synchronized only when [`NodeStorage::flush`] is called.
+    /// synchronized only when [`StorageEngine::flush`] is called.
     Batch {
         /// Maximum number of unsynchronized records.
         max_records: usize,
@@ -46,7 +46,8 @@ pub enum SyncPolicy {
 pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
-    active_segment: SegmentName,
+    writer: SegmentWriter,
+    replay: ReplayState,
 }
 
 impl StorageEngine {
@@ -54,73 +55,86 @@ impl StorageEngine {
     pub fn new<P: AsRef<Path>>(dir: P, sync: SyncPolicy) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir, sync)?;
+        let active_segment = SegmentName::first_append();
+        let replay = replay_storage_dir(&dir, active_segment)?;
+        let writer = SegmentWriter::open(&dir, sync, active_segment)?;
         Ok(Self {
             dir,
             sync,
-            active_segment: SegmentName::first_append(),
+            writer,
+            replay,
         })
     }
 
-    /// Opens storage for the given Raft node.
-    pub fn open(&self, node_id: noraft::NodeId) -> io::Result<NodeStorage> {
-        create_dir_all_synced(&self.dir, self.sync)?;
-        let replay = replay_storage_dir(&self.dir, self.active_segment)?;
-        if replay.removed_nodes.contains(&node_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "node storage has been removed",
-            ));
+    /// Loads the current state for the given Raft node.
+    pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
+        if self.replay.removed_nodes.contains(&node_id) {
+            return Err(node_removed_error());
         }
-
-        let segment_path = self.active_segment.path(&self.dir);
-        let file_existed = segment_path.exists();
-        let mut file = open_active_segment_file(&segment_path)?;
-        if !file_existed && should_sync_metadata(self.sync) {
-            sync_parent_dir(&segment_path)?;
-        }
-        file.seek(SeekFrom::End(0))?;
-
-        Ok(NodeStorage {
-            node_id,
-            file,
-            state: replay.nodes.get(&node_id).cloned().unwrap_or_default(),
-            sync: self.sync,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
-        })
+        Ok(self.replay.nodes.get(&node_id).cloned().unwrap_or_default())
     }
 
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
-        replay_storage_dir(&self.dir, self.active_segment).map(|replay| replay.nodes)
+        Ok(self.replay.nodes.clone())
+    }
+
+    /// Saves the current term for the given Raft node.
+    pub fn save_current_term(
+        &mut self,
+        node_id: noraft::NodeId,
+        term: noraft::Term,
+    ) -> io::Result<()> {
+        self.save_record(node_id, Record::CurrentTerm(term))
+    }
+
+    /// Saves the node voted for in the current term.
+    pub fn save_voted_for(
+        &mut self,
+        node_id: noraft::NodeId,
+        voted_for: Option<noraft::NodeId>,
+    ) -> io::Result<()> {
+        self.save_record(node_id, Record::VotedFor(voted_for))
+    }
+
+    /// Appends log entries and their command payloads.
+    pub fn append_entries(
+        &mut self,
+        node_id: noraft::NodeId,
+        append: &LogAppend,
+    ) -> io::Result<()> {
+        self.save_record(node_id, Record::Append(append.clone()))
+    }
+
+    /// Saves a snapshot.
+    pub fn save_snapshot(
+        &mut self,
+        node_id: noraft::NodeId,
+        snapshot: &Snapshot,
+    ) -> io::Result<()> {
+        self.save_record(node_id, Record::Snapshot(snapshot.clone()))
     }
 
     /// Records removal of all durable data for the given Raft node.
-    ///
-    /// The caller should close any existing [`NodeStorage`] for the same node
-    /// before calling this method.
-    pub fn remove_node(&self, node_id: noraft::NodeId) -> io::Result<()> {
-        create_dir_all_synced(&self.dir, self.sync)?;
-        let segment_path = self.active_segment.path(&self.dir);
-        let file_existed = segment_path.exists();
-        let mut file = open_active_segment_file(&segment_path)?;
-        if !file_existed && should_sync_metadata(self.sync) {
-            sync_parent_dir(&segment_path)?;
+    pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
+        if self.replay.removed_nodes.contains(&node_id) {
+            return Ok(());
         }
 
-        let frame = encode_record_frame(node_id, &Record::NodeRemoved)?;
-        let written_bytes =
-            u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
-        file.write_all(&frame)?;
-        sync_after_write(&mut file, self.sync, 1, written_bytes)?;
+        let record = Record::NodeRemoved;
+        self.writer.append(node_id, &record)?;
+        self.replay.apply(NodeRecord { node_id, record })?;
         Ok(())
     }
 
+    /// Flushes pending writes.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
     /// Removes all storage data managed by this engine.
-    ///
-    /// The caller should close any existing [`NodeStorage`] in this engine
-    /// before calling this method.
-    pub fn remove_all(&self) -> io::Result<()> {
+    pub fn remove_all(self) -> io::Result<()> {
+        drop(self.writer);
         remove_storage_dir_if_exists(&self.dir, self.sync)
     }
 
@@ -133,68 +147,51 @@ impl StorageEngine {
     pub fn sync_policy(&self) -> SyncPolicy {
         self.sync
     }
+
+    fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
+        if self.replay.removed_nodes.contains(&node_id) {
+            return Err(node_removed_error());
+        }
+
+        let mut next_state = self.replay.nodes.get(&node_id).cloned().unwrap_or_default();
+        apply_record_to_state(&mut next_state, &record)?;
+        self.writer.append(node_id, &record)?;
+        self.replay.nodes.insert(node_id, next_state);
+        Ok(())
+    }
 }
 
-/// Per-node handle backed by the shared segment log.
 #[derive(Debug)]
-pub struct NodeStorage {
-    node_id: noraft::NodeId,
+struct SegmentWriter {
+    active_segment: SegmentName,
     file: File,
-    state: StorageState,
     sync: SyncPolicy,
     unsynced_records: usize,
     unsynced_bytes: u64,
 }
 
-impl NodeStorage {
-    /// Returns the Raft node ID managed by this handle.
-    pub fn node_id(&self) -> noraft::NodeId {
-        self.node_id
-    }
-
-    /// Returns the current loaded state.
-    pub fn load(&self) -> StorageState {
-        self.state.clone()
-    }
-
-    /// Saves the current term.
-    pub fn save_current_term(&mut self, term: noraft::Term) -> io::Result<()> {
-        self.save_record(Record::CurrentTerm(term))
-    }
-
-    /// Saves the node voted for in the current term.
-    pub fn save_voted_for(&mut self, voted_for: Option<noraft::NodeId>) -> io::Result<()> {
-        self.save_record(Record::VotedFor(voted_for))
-    }
-
-    /// Appends log entries and their command payloads.
-    pub fn append_entries(&mut self, append: &LogAppend) -> io::Result<()> {
-        self.save_record(Record::Append(append.clone()))
-    }
-
-    /// Saves a snapshot.
-    pub fn save_snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
-        self.save_record(Record::Snapshot(snapshot.clone()))
-    }
-
-    /// Flushes pending writes.
-    pub fn flush(&mut self) -> io::Result<()> {
-        match self.sync {
-            SyncPolicy::UnsafeNoSync => Ok(()),
-            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(),
+impl SegmentWriter {
+    fn open(dir: &Path, sync: SyncPolicy, active_segment: SegmentName) -> io::Result<Self> {
+        let segment_path = active_segment.path(dir);
+        let file_existed = segment_path.exists();
+        let mut file = open_active_segment_file(&segment_path)?;
+        if !file_existed && should_sync_metadata(sync) {
+            sync_parent_dir(&segment_path)?;
         }
+        file.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            active_segment,
+            file,
+            sync,
+            unsynced_records: 0,
+            unsynced_bytes: 0,
+        })
     }
 
-    fn save_record(&mut self, record: Record) -> io::Result<()> {
-        let mut next_state = self.state.clone();
-        apply_record_to_state(&mut next_state, &record)?;
-        self.append_record(&record)?;
-        self.state = next_state;
-        Ok(())
-    }
-
-    fn append_record(&mut self, record: &Record) -> io::Result<()> {
-        let frame = encode_record_frame(self.node_id, record)?;
+    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<()> {
+        debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
+        let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
         self.file.write_all(&frame)?;
@@ -226,6 +223,13 @@ impl NodeStorage {
         self.unsynced_records = 0;
         self.unsynced_bytes = 0;
         Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.sync {
+            SyncPolicy::UnsafeNoSync => Ok(()),
+            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(),
+        }
     }
 }
 
@@ -595,29 +599,6 @@ fn open_active_segment_file(path: &Path) -> io::Result<File> {
 
 fn should_sync_metadata(sync: SyncPolicy) -> bool {
     !matches!(sync, SyncPolicy::UnsafeNoSync)
-}
-
-fn sync_after_write(
-    file: &mut File,
-    sync: SyncPolicy,
-    unsynced_records: usize,
-    unsynced_bytes: u64,
-) -> io::Result<()> {
-    match sync {
-        SyncPolicy::Strict => file.sync_data(),
-        SyncPolicy::Batch {
-            max_records,
-            max_bytes,
-        } => {
-            let records_reached = max_records != 0 && max_records <= unsynced_records;
-            let bytes_reached = max_bytes != 0 && max_bytes <= unsynced_bytes;
-            if records_reached || bytes_reached {
-                file.sync_data()?;
-            }
-            Ok(())
-        }
-        SyncPolicy::UnsafeNoSync => Ok(()),
-    }
 }
 
 fn create_dir_all_synced(path: &Path, sync: SyncPolicy) -> io::Result<()> {
@@ -1061,6 +1042,10 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn node_removed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "node storage has been removed")
 }
 
 fn remove_storage_dir_if_exists(path: &Path, sync: SyncPolicy) -> io::Result<()> {

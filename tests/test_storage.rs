@@ -84,16 +84,14 @@ fn storage_state_applies_log_suffix_replacement() {
 #[test]
 fn storage_engine_replays_records_for_multiple_nodes() {
     let dir = unique_temp_dir("sukari-storage-replay");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
 
-    let mut node1 = engine
-        .open(noraft::NodeId::new(1))
-        .expect("node 1 storage should open");
-    node1
-        .save_current_term(noraft::Term::new(4))
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(4))
         .expect("term should be stored");
-    node1
-        .save_voted_for(Some(noraft::NodeId::new(9)))
+    engine
+        .save_voted_for(noraft::NodeId::new(1), Some(noraft::NodeId::new(9)))
         .expect("vote should be stored");
     let append = append(
         position(0, 0),
@@ -103,24 +101,19 @@ fn storage_engine_replays_records_for_multiple_nodes() {
         ],
         [(2, Bytes::from(b"command".as_slice()))],
     );
-    node1
-        .append_entries(&append)
+    engine
+        .append_entries(noraft::NodeId::new(1), &append)
         .expect("entries should be stored");
-    drop(node1);
 
-    let mut node2 = engine
-        .open(noraft::NodeId::new(2))
-        .expect("node 2 storage should open");
-    node2
-        .save_current_term(noraft::Term::new(7))
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(7))
         .expect("node 2 term should be stored");
-    drop(node2);
+    drop(engine);
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    let node1 = engine
-        .open(noraft::NodeId::new(1))
-        .expect("node 1 storage should reopen");
-    let state1 = node1.load();
+    let state1 = engine
+        .load(noraft::NodeId::new(1))
+        .expect("node 1 state should load");
     assert_eq!(state1.current_term, noraft::Term::new(4));
     assert_eq!(state1.voted_for, Some(noraft::NodeId::new(9)));
     assert_eq!(state1.log.entries().last_position(), position(4, 2));
@@ -129,10 +122,10 @@ fn storage_engine_replays_records_for_multiple_nodes() {
         Some(&b"command"[..])
     );
 
-    let node2 = engine
-        .open(noraft::NodeId::new(2))
-        .expect("node 2 storage should reopen");
-    assert_eq!(node2.load().current_term, noraft::Term::new(7));
+    let state2 = engine
+        .load(noraft::NodeId::new(2))
+        .expect("node 2 state should load");
+    assert_eq!(state2.current_term, noraft::Term::new(7));
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -140,10 +133,8 @@ fn storage_engine_replays_records_for_multiple_nodes() {
 #[test]
 fn storage_engine_replays_snapshots() {
     let dir = unique_temp_dir("sukari-storage-snapshot");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    let mut storage = engine
-        .open(noraft::NodeId::new(3))
-        .expect("node storage should open");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
 
     let append = append(
         position(0, 0),
@@ -157,8 +148,8 @@ fn storage_engine_replays_snapshots() {
             (3, Bytes::from(b"three".as_slice())),
         ],
     );
-    storage
-        .append_entries(&append)
+    engine
+        .append_entries(noraft::NodeId::new(3), &append)
         .expect("entries should be stored");
 
     let snapshot = Snapshot {
@@ -166,16 +157,15 @@ fn storage_engine_replays_snapshots() {
         config: noraft::ClusterConfig::new(),
         data: Bytes::from(b"snapshot".as_slice()),
     };
-    storage
-        .save_snapshot(&snapshot)
+    engine
+        .save_snapshot(noraft::NodeId::new(3), &snapshot)
         .expect("snapshot should be stored");
-    drop(storage);
+    drop(engine);
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    let storage = engine
-        .open(noraft::NodeId::new(3))
-        .expect("node storage should reopen");
-    let state = storage.load();
+    let state = engine
+        .load(noraft::NodeId::new(3))
+        .expect("node state should load");
     assert_eq!(state.log.entries().prev_position(), position(2, 2));
     assert_eq!(state.log.entries().last_position(), position(2, 3));
     assert_eq!(state.commands.get(&index(2)), None);
@@ -198,14 +188,11 @@ fn storage_engine_replays_snapshots() {
 #[test]
 fn storage_engine_tombstone_hides_removed_node() {
     let dir = unique_temp_dir("sukari-storage-remove");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    let mut storage = engine
-        .open(noraft::NodeId::new(5))
-        .expect("node storage should open");
-    storage
-        .save_current_term(noraft::Term::new(8))
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    engine
+        .save_current_term(noraft::NodeId::new(5), noraft::Term::new(8))
         .expect("term should be stored");
-    drop(storage);
 
     engine
         .remove_node(noraft::NodeId::new(5))
@@ -215,8 +202,8 @@ fn storage_engine_tombstone_hides_removed_node() {
     assert!(!all.contains_key(&noraft::NodeId::new(5)));
 
     let err = engine
-        .open(noraft::NodeId::new(5))
-        .expect_err("removed node should not reopen");
+        .load(noraft::NodeId::new(5))
+        .expect_err("removed node should not load");
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
@@ -225,14 +212,12 @@ fn storage_engine_tombstone_hides_removed_node() {
 #[test]
 fn storage_engine_truncates_trailing_partial_record() {
     let dir = unique_temp_dir("sukari-storage-partial");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    let mut storage = engine
-        .open(noraft::NodeId::new(2))
-        .expect("node storage should open");
-    storage
-        .save_current_term(noraft::Term::new(6))
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(6))
         .expect("term should be stored");
-    drop(storage);
+    drop(engine);
 
     let path = segment_path(&dir);
     let stable_len = std::fs::metadata(&path)
@@ -247,10 +232,13 @@ fn storage_engine_truncates_trailing_partial_record() {
     drop(file);
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    let storage = engine
-        .open(noraft::NodeId::new(2))
-        .expect("node storage should reopen");
-    assert_eq!(storage.load().current_term, noraft::Term::new(6));
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(2))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(6)
+    );
     assert_eq!(
         std::fs::metadata(&path)
             .expect("segment should still exist")
@@ -264,14 +252,12 @@ fn storage_engine_truncates_trailing_partial_record() {
 #[test]
 fn storage_engine_rejects_corrupted_checksum() {
     let dir = unique_temp_dir("sukari-storage-corrupt");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    let mut storage = engine
-        .open(noraft::NodeId::new(2))
-        .expect("node storage should open");
-    storage
-        .save_current_term(noraft::Term::new(6))
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(6))
         .expect("term should be stored");
-    drop(storage);
+    drop(engine);
 
     let path = segment_path(&dir);
     let mut file = OpenOptions::new()
@@ -284,9 +270,7 @@ fn storage_engine_rejects_corrupted_checksum() {
         .expect("segment body should be corrupted");
     drop(file);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    let err = engine
-        .open(noraft::NodeId::new(2))
+    let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
         .expect_err("corrupted segment should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
@@ -296,14 +280,11 @@ fn storage_engine_rejects_corrupted_checksum() {
 #[test]
 fn storage_engine_removes_all_data() {
     let dir = unique_temp_dir("sukari-storage-remove-all");
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    let mut storage = engine
-        .open(noraft::NodeId::new(1))
-        .expect("node storage should open");
-    storage
-        .save_current_term(noraft::Term::new(1))
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
         .expect("term should be stored");
-    drop(storage);
 
     engine
         .remove_all()
