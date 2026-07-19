@@ -76,7 +76,7 @@ fn exercise_segment(segment: &[u8]) {
         return;
     }
 
-    let Ok(engine) = StorageEngine::new(dir.path(), SyncPolicy::UnsafeNoSync) else {
+    let Ok(mut engine) = StorageEngine::new(dir.path(), SyncPolicy::UnsafeNoSync) else {
         return;
     };
     let _ = engine.load_all();

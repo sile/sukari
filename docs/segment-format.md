@@ -69,6 +69,7 @@ LogEntries
 8 bytes       command payload count as u64
 repeated:
   8 bytes     command log index as u64
+  1 byte      command payload tag as u8
   Bytes       command payload
 ```
 
@@ -89,10 +90,11 @@ repeated:
 2  command entry: no inline payload
 ```
 
-Command bytes are stored in the append command map keyed by log index rather
-than inside the `LogEntry::Command` item. The storage layer validates that every
-command entry has exactly one matching command payload and that no payload is
-provided for a non-command entry.
+Command payloads are stored in the append command payload map keyed by log index
+rather than inside the `LogEntry::Command` item. The storage layer persists the
+payload tag without interpreting it. It validates that every command entry has
+exactly one matching command payload and that no payload is provided for a
+non-command entry.
 
 ## Snapshot Checkpoint
 

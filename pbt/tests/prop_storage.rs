@@ -6,8 +6,8 @@ use std::{
 
 use proptest::prelude::*;
 use sukari::{
-    Bytes, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
-    SyncPolicy,
+    Bytes, CommandPayload, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint,
+    StorageEngine, SyncPolicy,
 };
 
 const NODE_ID: noraft::NodeId = noraft::NodeId::new(1);
@@ -34,7 +34,7 @@ enum Operation {
 enum GeneratedEntry {
     Term(u64),
     ClusterConfig(GeneratedConfig),
-    Command(Vec<u8>),
+    Command { tag: u8, payload: Vec<u8> },
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +98,8 @@ fn generated_entry() -> impl Strategy<Value = GeneratedEntry> {
     prop_oneof![
         (0u64..=8).prop_map(GeneratedEntry::Term),
         generated_config().prop_map(GeneratedEntry::ClusterConfig),
-        proptest::collection::vec(any::<u8>(), 0..=24).prop_map(GeneratedEntry::Command),
+        (any::<u8>(), proptest::collection::vec(any::<u8>(), 0..=24))
+            .prop_map(|(tag, payload)| GeneratedEntry::Command { tag, payload }),
     ]
 }
 
@@ -183,9 +184,12 @@ fn log_append(prev_position: noraft::LogPosition, entries: Vec<GeneratedEntry>) 
             GeneratedEntry::ClusterConfig(config) => {
                 log_entries.push(noraft::LogEntry::ClusterConfig(cluster_config(config)));
             }
-            GeneratedEntry::Command(payload) => {
+            GeneratedEntry::Command { tag, payload } => {
                 log_entries.push(noraft::LogEntry::Command);
-                commands.insert(noraft::LogIndex::new(next_index), Bytes::from(payload));
+                commands.insert(
+                    noraft::LogIndex::new(next_index),
+                    CommandPayload::new(tag, Bytes::from(payload)),
+                );
             }
         }
     }
@@ -262,7 +266,7 @@ fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operati
             expected.voted_for = checkpoint.voted_for;
             expected.log =
                 noraft::Log::new(snapshot.config.clone(), checkpoint.suffix.entries().clone());
-            expected.commands = checkpoint.suffix.commands().clone();
+            expected.command_payloads = checkpoint.suffix.command_payloads().clone();
             expected.snapshot = Some(snapshot);
         }
     }

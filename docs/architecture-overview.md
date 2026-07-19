@@ -97,6 +97,9 @@ loaded log before writing. Divergent log suffixes caused by leader changes are
 reconciled by deterministic replay, which applies records in their original
 append order.
 
+Command payload tags are persisted and replayed without interpretation. Their
+meaning belongs to the caller.
+
 The on-disk segment record format is specified in
 [segment-format.md](segment-format.md).
 
@@ -253,7 +256,7 @@ file-name order, and rebuilds per-node state:
 - current term
 - voted-for node
 - log entries
-- command payloads
+- tagged command payloads
 - latest snapshot metadata and data or reference
 
 The implementation does not require an on-disk random-read log index.

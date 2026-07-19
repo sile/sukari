@@ -22,4 +22,6 @@ mod storage;
 pub use bytes::Bytes;
 pub use registry::NodeMetadata;
 pub use stats::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
-pub use storage::{LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, SyncPolicy};
+pub use storage::{
+    CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, SyncPolicy,
+};

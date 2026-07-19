@@ -534,9 +534,41 @@ impl SegmentWriter {
     }
 }
 
+/// Application-defined payload for a command log entry.
+///
+/// The storage layer persists the tag and bytes but does not interpret either
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPayload {
+    tag: u8,
+    bytes: Bytes,
+}
+
+impl CommandPayload {
+    /// Makes a command payload with an application-defined tag.
+    pub fn new(tag: u8, bytes: Bytes) -> Self {
+        Self { tag, bytes }
+    }
+
+    /// Returns the application-defined payload tag.
+    pub fn tag(&self) -> u8 {
+        self.tag
+    }
+
+    /// Returns the opaque payload bytes.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// Converts this payload into opaque bytes.
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+}
+
 /// A persisted log append operation.
 ///
-/// The value pairs `noraft` log entries with opaque command payload bytes.
+/// The value pairs `noraft` log entries with tagged opaque command payloads.
 /// Construction validates only the record-local payload mapping: every command
 /// entry must have one payload, and payloads must not exist for non-command
 /// entries.
@@ -546,16 +578,19 @@ pub struct LogAppend {
     entries: noraft::LogEntries,
 
     /// Command payloads keyed by log index.
-    commands: BTreeMap<noraft::LogIndex, Bytes>,
+    command_payloads: BTreeMap<noraft::LogIndex, CommandPayload>,
 }
 
 impl LogAppend {
     /// Makes a new append operation after validating command payload mapping.
     pub fn new(
         entries: noraft::LogEntries,
-        commands: BTreeMap<noraft::LogIndex, Bytes>,
+        command_payloads: BTreeMap<noraft::LogIndex, CommandPayload>,
     ) -> io::Result<Self> {
-        let this = Self { entries, commands };
+        let this = Self {
+            entries,
+            command_payloads,
+        };
         this.validate()?;
         Ok(this)
     }
@@ -566,18 +601,20 @@ impl LogAppend {
     }
 
     /// Returns command payloads keyed by log index.
-    pub fn commands(&self) -> &BTreeMap<noraft::LogIndex, Bytes> {
-        &self.commands
+    pub fn command_payloads(&self) -> &BTreeMap<noraft::LogIndex, CommandPayload> {
+        &self.command_payloads
     }
 
     fn validate(&self) -> io::Result<()> {
         for (position, entry) in self.entries.iter_with_positions() {
-            if entry == noraft::LogEntry::Command && !self.commands.contains_key(&position.index) {
+            if entry == noraft::LogEntry::Command
+                && !self.command_payloads.contains_key(&position.index)
+            {
                 return Err(invalid_input("missing command payload"));
             }
         }
 
-        for index in self.commands.keys().copied() {
+        for index in self.command_payloads.keys().copied() {
             if self.entries.get_entry(index) != Some(noraft::LogEntry::Command) {
                 return Err(invalid_input(
                     "command payload index does not match a command entry",
@@ -683,7 +720,7 @@ pub struct NodeState {
     pub log: noraft::Log,
 
     /// Command payloads keyed by log index.
-    pub commands: BTreeMap<noraft::LogIndex, Bytes>,
+    pub command_payloads: BTreeMap<noraft::LogIndex, CommandPayload>,
 
     /// Latest snapshot.
     pub snapshot: Option<Snapshot>,
@@ -698,7 +735,7 @@ impl Default for NodeState {
                 noraft::ClusterConfig::new(),
                 noraft::LogEntries::new(noraft::LogPosition::ZERO),
             ),
-            commands: BTreeMap::new(),
+            command_payloads: BTreeMap::new(),
             snapshot: None,
         }
     }
@@ -739,8 +776,9 @@ impl NodeState {
         self.log = noraft::Log::new(self.log.snapshot_config().clone(), entries);
 
         let prev_index = append.entries.prev_position().index;
-        self.commands.retain(|index, _| *index <= prev_index);
-        self.commands.extend(append.commands);
+        self.command_payloads
+            .retain(|index, _| *index <= prev_index);
+        self.command_payloads.extend(append.command_payloads);
         Ok(())
     }
 
@@ -763,7 +801,7 @@ impl NodeState {
             return Err(invalid_data("invalid snapshot log suffix"));
         }
 
-        self.commands
+        self.command_payloads
             .retain(|index, _| snapshot.last_included.index < *index);
         self.log = noraft::Log::new(snapshot.config.clone(), entries);
         self.snapshot = Some(snapshot);
@@ -1884,11 +1922,13 @@ fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()
     append.validate()?;
     encode_log_entries(&append.entries, encoder)?;
     encoder.put_u64(
-        u64::try_from(append.commands.len()).map_err(|_| invalid_input("too many commands"))?,
+        u64::try_from(append.command_payloads.len())
+            .map_err(|_| invalid_input("too many command payloads"))?,
     );
-    for (index, payload) in &append.commands {
+    for (index, payload) in &append.command_payloads {
         encode_log_index(*index, encoder);
-        encoder.put_bytes(payload.as_slice())?;
+        encoder.put_u8(payload.tag());
+        encoder.put_bytes(payload.bytes().as_slice())?;
     }
     Ok(())
 }
@@ -1897,19 +1937,21 @@ fn decode_log_append(decoder: &mut Decoder<'_>) -> io::Result<LogAppend> {
     let entries = decode_log_entries(decoder)?;
     let command_count = decoder.get_u64()?;
     if MAX_SET_ITEMS < command_count {
-        return Err(invalid_data("too many commands"));
+        return Err(invalid_data("too many command payloads"));
     }
 
-    let mut commands = BTreeMap::new();
+    let mut command_payloads = BTreeMap::new();
     for _ in 0..command_count {
         let index = decode_log_index(decoder)?;
-        let payload = Bytes::from(decoder.get_bytes()?);
-        if commands.insert(index, payload).is_some() {
+        let tag = decoder.get_u8()?;
+        let payload = CommandPayload::new(tag, Bytes::from(decoder.get_bytes()?));
+        if command_payloads.insert(index, payload).is_some() {
             return Err(invalid_data("duplicate command payload index"));
         }
     }
 
-    LogAppend::new(entries, commands).map_err(|_| invalid_data("invalid command payload mapping"))
+    LogAppend::new(entries, command_payloads)
+        .map_err(|_| invalid_data("invalid command payload mapping"))
 }
 
 fn encode_snapshot(snapshot: &Snapshot, encoder: &mut Encoder) -> io::Result<()> {

@@ -1,6 +1,6 @@
 use sukari::{
-    Bytes, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
-    SyncPolicy,
+    Bytes, CommandPayload, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint,
+    StorageEngine, SyncPolicy,
 };
 
 use std::{
@@ -42,11 +42,44 @@ fn log_append_rejects_payloads_without_command_entries() {
         [noraft::LogEntry::Term(noraft::Term::new(1))],
     );
     let mut commands = BTreeMap::new();
-    commands.insert(noraft::LogIndex::new(1), Bytes::from(b"command".as_slice()));
+    commands.insert(
+        noraft::LogIndex::new(1),
+        command_payload(Bytes::from(b"command".as_slice())),
+    );
 
     let err =
         LogAppend::new(entries, commands).expect_err("term entries should not accept payloads");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn storage_engine_replays_command_payload_tags() {
+    let dir = unique_temp_dir("sukari-storage-command-payload-tags");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+
+    let entries =
+        noraft::LogEntries::from_iter(noraft::LogPosition::ZERO, [noraft::LogEntry::Command]);
+    let payload = CommandPayload::new(7, Bytes::from(b"tagged-command".as_slice()));
+    let command_payloads = BTreeMap::from([(noraft::LogIndex::new(1), payload.clone())]);
+    engine
+        .append_entries(
+            noraft::NodeId::new(1),
+            LogAppend::new(entries, command_payloads)
+                .expect("append should have matching command payloads"),
+        )
+        .expect("append should be stored");
+    drop(engine);
+
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let state = engine
+        .load(noraft::NodeId::new(1))
+        .expect("node state should load");
+    assert_eq!(state.command_payloads.get(&index(1)), Some(&payload));
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
 
 #[test]
@@ -1175,8 +1208,14 @@ fn storage_engine_does_not_collect_after_node_creation() {
 fn node_state_applies_log_suffix_replacement() {
     let mut state = NodeState::default();
     let mut commands = BTreeMap::new();
-    commands.insert(noraft::LogIndex::new(2), Bytes::from(b"old-2".as_slice()));
-    commands.insert(noraft::LogIndex::new(3), Bytes::from(b"old-3".as_slice()));
+    commands.insert(
+        noraft::LogIndex::new(2),
+        command_payload(Bytes::from(b"old-2".as_slice())),
+    );
+    commands.insert(
+        noraft::LogIndex::new(3),
+        command_payload(Bytes::from(b"old-3".as_slice())),
+    );
 
     let initial_entries = noraft::LogEntries::from_iter(
         noraft::LogPosition::ZERO,
@@ -1193,7 +1232,10 @@ fn node_state_applies_log_suffix_replacement() {
         .expect("initial append should apply");
 
     let mut replacement_commands = BTreeMap::new();
-    replacement_commands.insert(noraft::LogIndex::new(2), Bytes::from(b"new-2".as_slice()));
+    replacement_commands.insert(
+        noraft::LogIndex::new(2),
+        command_payload(Bytes::from(b"new-2".as_slice())),
+    );
     let replacement_entries =
         noraft::LogEntries::from_iter(position(1, 1), [noraft::LogEntry::Command]);
     let replacement_append = LogAppend::new(replacement_entries, replacement_commands)
@@ -1203,13 +1245,13 @@ fn node_state_applies_log_suffix_replacement() {
         .expect("replacement append should apply");
 
     assert_eq!(state.log.entries().last_position(), position(1, 2));
-    assert_eq!(state.commands.len(), 1);
+    assert_eq!(state.command_payloads.len(), 1);
     assert_eq!(
         state
-            .commands
+            .command_payloads
             .get(&noraft::LogIndex::new(2))
-            .expect("replacement payload should exist")
-            .as_slice(),
+            .map(command_payload_bytes)
+            .expect("replacement payload should exist"),
         b"new-2"
     );
 }
@@ -1254,7 +1296,10 @@ fn storage_engine_replays_records_for_multiple_nodes() {
     assert_eq!(state1.voted_for, Some(noraft::NodeId::new(9)));
     assert_eq!(state1.log.entries().last_position(), position(4, 2));
     assert_eq!(
-        state1.commands.get(&index(2)).map(Bytes::as_slice),
+        state1
+            .command_payloads
+            .get(&index(2))
+            .map(command_payload_bytes),
         Some(&b"command"[..])
     );
 
@@ -1606,9 +1651,12 @@ fn storage_engine_replays_snapshots() {
         .expect("node state should load");
     assert_eq!(state.log.entries().prev_position(), position(2, 2));
     assert_eq!(state.log.entries().last_position(), position(2, 3));
-    assert_eq!(state.commands.get(&index(2)), None);
+    assert_eq!(state.command_payloads.get(&index(2)), None);
     assert_eq!(
-        state.commands.get(&index(3)).map(Bytes::as_slice),
+        state
+            .command_payloads
+            .get(&index(3))
+            .map(command_payload_bytes),
         Some(&b"three"[..])
     );
     assert_eq!(
@@ -1681,13 +1729,19 @@ fn storage_engine_replays_snapshot_checkpoints() {
     assert_eq!(state.voted_for, Some(noraft::NodeId::new(7)));
     assert_eq!(state.log.entries().prev_position(), position(3, 3));
     assert_eq!(state.log.entries().last_position(), position(4, 6));
-    assert_eq!(state.commands.get(&index(1)), None);
+    assert_eq!(state.command_payloads.get(&index(1)), None);
     assert_eq!(
-        state.commands.get(&index(5)).map(Bytes::as_slice),
+        state
+            .command_payloads
+            .get(&index(5))
+            .map(command_payload_bytes),
         Some(&b"checkpoint-command"[..])
     );
     assert_eq!(
-        state.commands.get(&index(6)).map(Bytes::as_slice),
+        state
+            .command_payloads
+            .get(&index(6))
+            .map(command_payload_bytes),
         Some(&b"later-command"[..])
     );
     assert_eq!(
@@ -1988,10 +2042,18 @@ where
         noraft::LogEntries::from_iter(prev_position, entries),
         commands
             .into_iter()
-            .map(|(index, payload)| (noraft::LogIndex::new(index), payload))
+            .map(|(index, payload)| (noraft::LogIndex::new(index), command_payload(payload)))
             .collect(),
     )
     .expect("append should have matching command payloads")
+}
+
+fn command_payload(bytes: Bytes) -> CommandPayload {
+    CommandPayload::new(0, bytes)
+}
+
+fn command_payload_bytes(payload: &CommandPayload) -> &[u8] {
+    payload.bytes().as_slice()
 }
 
 fn snapshot(last_included: noraft::LogPosition, data: &[u8]) -> Snapshot {

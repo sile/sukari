@@ -41,7 +41,7 @@ The public API uses `noraft` and `nojson` types directly.
 ```rust
 use std::collections::BTreeMap;
 
-use sukari::{Bytes, LogAppend, NodeMetadata, StorageEngine, SyncPolicy};
+use sukari::{Bytes, CommandPayload, LogAppend, NodeMetadata, StorageEngine, SyncPolicy};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join("sukari-readme-example");
@@ -68,10 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             noraft::LogEntry::Command,
         ],
     );
-    let mut commands = BTreeMap::new();
-    commands.insert(noraft::LogIndex::new(2), Bytes::from(b"command".as_slice()));
+    let mut command_payloads = BTreeMap::new();
+    command_payloads.insert(
+        noraft::LogIndex::new(2),
+        CommandPayload::new(0, Bytes::from(b"command".as_slice())),
+    );
 
-    storage.append_entries(node_id, LogAppend::new(entries, commands)?)?;
+    storage.append_entries(node_id, LogAppend::new(entries, command_payloads)?)?;
     storage.flush()?;
 
     let state = storage.load(node_id)?;
