@@ -10,10 +10,12 @@ Update it as the implementation changes.
 The crate should own:
 
 - shared segment file format
-- manifest format
+- advisory manifest format
+- garbage-collection metadata format
 - deterministic replay
 - per-node replay state
-- rewrite and purge state machines
+- snapshot checkpoint semantics
+- automatic whole-segment garbage collection
 - node registry metadata for storage namespace ownership
 - storage metrics
 - migration tools from per-node WAL if needed
@@ -32,6 +34,7 @@ the storage operations commonly emitted by `noraft`-based runtimes:
 - save voted-for node
 - append log entries and command payloads
 - save latest snapshot state
+- save snapshot checkpoints that supersede earlier node records
 - replay a node's persistent state at startup
 - mark a node removed and reserve its node ID
 
@@ -60,7 +63,7 @@ and non-zero numeric segment ID. Startup reads an advisory manifest when it is
 available, validates the hinted active append segment against existing segment
 files, and follows any subsequent contiguous append segment files before opening
 the writer. Startup falls back to a file-name scan when the manifest is missing,
-malformed, unsupported, names a rewrite segment, or points at a non-existent
+malformed, unsupported, names a non-append segment, or points at a non-existent
 segment. New writes rotate to the next append segment when the configured
 segment length would be exceeded. A single record that exceeds the limit is
 written to an empty segment by itself.
@@ -123,9 +126,9 @@ The intended full design is a shared segmented append-only design:
 storage/
   nodes.json
   manifest
+  gc.json
   append-000001.segment
   append-000002.segment
-  rewrite-000010.segment
 ```
 
 ## Node Registry
@@ -200,7 +203,7 @@ The current implementation stores a small advisory JSON manifest file:
 
 The manifest accelerates active append segment selection, but it is not
 authoritative. Startup ignores `manifest.tmp`. If `manifest` is missing,
-malformed, has an unsupported version, names a rewrite segment, or points at a
+malformed, has an unsupported version, names a non-append segment, or points at a
 non-existent segment, startup falls back to scanning segment file names. If the
 hint names an older existing append segment, startup advances through subsequent
 contiguous append segment file names instead of trusting the old hint as-is.
@@ -211,10 +214,44 @@ metadata when required by the sync policy, and then atomically replaces
 manifest in place. A crash after the rename records the new hint. Recovery must
 still discover segment files and must not depend only on the manifest.
 
+## Snapshot Checkpoints
+
+The full design should add a snapshot checkpoint operation. A checkpoint is
+stronger than saving a snapshot alone: it records a complete recovery point for
+one node and declares that earlier records for that node are no longer needed.
+
+The intended API shape is:
+
+```rust
+pub struct SnapshotCheckpoint {
+    pub current_term: noraft::Term,
+    pub voted_for: Option<noraft::NodeId>,
+    pub snapshot: Snapshot,
+    pub suffix: LogAppend,
+}
+
+pub fn save_snapshot_checkpoint(
+    &mut self,
+    node_id: noraft::NodeId,
+    checkpoint: SnapshotCheckpoint,
+) -> io::Result<()>;
+```
+
+The checkpoint record should contain the current term, voted-for node,
+snapshot, and retained log suffix after the snapshot. If a caller still needs
+log entries after the snapshot position, it must include them in the checkpoint
+suffix or append them again after the checkpoint has been saved. Replay may
+ignore older records for the same node once it sees a valid checkpoint. The
+checkpoint suffix should start at the snapshot's last included position.
+
+`save_snapshot()` remains a plain snapshot record. It should not by itself
+advance garbage-collection metadata because it does not necessarily include
+current term, voted-for node, or a complete retained suffix.
+
 ## Replay
 
-Startup discovers `append-*.segment` and `rewrite-*.segment` files, replays them
-in deterministic file-name order, and rebuilds per-node state:
+Startup discovers `append-*.segment` files, replays them in deterministic
+file-name order, and rebuilds per-node state:
 
 - current term
 - voted-for node
@@ -254,14 +291,53 @@ deleted when all records in that segment are obsolete. Snapshot progress for one
 node is not sufficient by itself. Removed nodes are identified from `nodes.json`;
 the segment stream does not contain node removal records.
 
-The engine will need one or more of these mechanisms:
+The initial design should avoid rewrite segments. It should not copy live
+records into separate rewrite files. This keeps crash recovery and replay
+ordering simple and avoids a data-loss-prone rewrite completion protocol.
 
-- segment-level live record accounting
-- rewrite of still-live records from old segments into rewrite segments
-- grouping by node shard or traffic class to reduce mixed-lifetime segments
-- temporary space amplification while old mixed segments remain live
+Instead, the engine should use whole-segment garbage collection. Whole-segment
+GC deletes only inactive append segments that are older than every active node's
+checkpoint barrier. If any active node has no checkpoint barrier, GC must keep
+older segments because that node may still need records before its first
+snapshot checkpoint. Removed nodes do not participate in the minimum barrier
+calculation.
 
-The first implementation should keep these rules explicit and conservative.
+The checkpoint barriers should be stored in a separate authoritative JSON file:
+
+```json
+{
+  "version": 1,
+  "nodes": {
+    "1": {
+      "checkpoint_segment": "append-000010.segment"
+    },
+    "2": {
+      "checkpoint_segment": "append-000008.segment"
+    }
+  }
+}
+```
+
+This file should be separate from `manifest`. The manifest is advisory and can
+be ignored when it is stale or malformed. `gc.json` controls deletion and is
+therefore authoritative. If `gc.json` is missing, the engine should behave as if
+no checkpoint barriers exist and should not delete old segments. If `gc.json`
+exists but is malformed, violates the schema, names a non-append segment, or
+points at a non-existent checkpoint segment, opening the engine should fail with
+`InvalidData`.
+
+`gc.json` should be updated by atomic replacement. A checkpoint update should
+append and durably sync the checkpoint record first when the sync policy
+requires it. Then it should write `gc.json.tmp`, sync it when durable metadata is
+required, rename it over `gc.json`, and sync the parent directory when durable
+metadata is required. A stale `gc.json.tmp` is ignored.
+
+Garbage collection should be automatic from the library user's perspective. The
+engine should opportunistically check whether GC is worthwhile after segment
+rotation, after a successful snapshot checkpoint, and after node removal. It
+should not require the caller to choose exact collection timing. A future
+`GcPolicy` can control thresholds such as the minimum number of inactive
+segments or minimum reclaimable bytes before deletion runs.
 
 ## Crash Recovery
 
@@ -271,8 +347,9 @@ The storage format needs explicit recovery rules for:
 - checksum mismatch
 - stale `manifest` or `manifest.tmp` after segment creation
 - segment rotation
-- rewrite segment creation
-- rewrite completion
+- snapshot checkpoint record append
+- `gc.json` update after checkpoint append
 - old segment deletion
 - stale `nodes.json.tmp` after registry update
-- process crash after fsyncing records before updating manifests
+- stale `gc.json.tmp` after checkpoint update
+- process crash after fsyncing records before updating metadata files
