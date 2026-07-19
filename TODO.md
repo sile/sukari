@@ -15,10 +15,6 @@
 
 - Document the `SKR1` format once the first release boundary is clear.
 
-## Replay
-
-- Decide whether inactive segments should ever tolerate trailing partial records.
-
 ## Compaction And Garbage Collection
 
 - Define `GcPolicy` thresholds for opportunistic deletion.

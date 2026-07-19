@@ -216,6 +216,59 @@ fn storage_engine_ignores_stale_node_registry_tmp() {
 }
 
 #[test]
+fn storage_engine_ignores_checkpoint_index_for_unregistered_node() {
+    let dir = unique_temp_dir("sukari-storage-create-node-crash-before-registry");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    engine
+        .create_node(
+            noraft::NodeId::new(1),
+            node_metadata(true, r#"{"role":"control"}"#),
+        )
+        .expect("node should be created");
+    drop(engine);
+
+    assert!(read_checkpoint_index(&dir).contains(r#""1": {"#));
+    std::fs::remove_file(dir.join(NODE_REGISTRY_FILE_NAME))
+        .expect("node registry should be removed");
+
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert!(engine.nodes().next().is_none());
+    assert!(engine.load_all().expect("states should load").is_empty());
+    let err = engine
+        .load(noraft::NodeId::new(1))
+        .expect_err("unregistered node should not load");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+    let metadata = node_metadata(true, r#"{"role":"recreated"}"#);
+    engine
+        .create_node(noraft::NodeId::new(1), metadata.clone())
+        .expect("node ID should be available when registry update was lost");
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(4))
+        .expect("term should be stored");
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .node_metadata(noraft::NodeId::new(1))
+            .expect("metadata should persist"),
+        &metadata
+    );
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(4)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_rejects_invalid_node_registry_files() {
     for (name, text) in [
         ("malformed", "{"),
@@ -509,6 +562,13 @@ fn storage_engine_load_all_falls_back_without_checkpoint_index() {
         .expect("checkpoint index should be removed");
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("state should load by full scan")
+            .current_term,
+        noraft::Term::new(5)
+    );
     let all = engine.load_all().expect("states should load by full scan");
     assert_eq!(
         all.get(&noraft::NodeId::new(1))
@@ -533,6 +593,39 @@ fn storage_engine_removes_removed_nodes_from_checkpoint_index() {
 
     let checkpoint_index = read_checkpoint_index(&dir);
     assert!(checkpoint_index.contains(r#""nodes": {}"#));
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_ignores_removed_node_checkpoint_index_entry_after_gc() {
+    let dir = unique_temp_dir("sukari-storage-removed-node-stale-checkpoint-index");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    create_node(&mut engine, 1);
+    let stale_checkpoint_index = read_checkpoint_index(&dir);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("term should be stored");
+    engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect("node should be removed");
+    assert!(!segment_path(&dir).exists());
+    drop(engine);
+
+    write_checkpoint_index(&dir, &stale_checkpoint_index);
+
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert!(engine.load_all().expect("states should load").is_empty());
+    let err = engine
+        .load(noraft::NodeId::new(1))
+        .expect_err("removed node should not load");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    let err = engine
+        .create_node(noraft::NodeId::new(1), NodeMetadata::default())
+        .expect_err("removed node ID should remain reserved");
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -940,6 +1033,47 @@ fn storage_engine_falls_back_from_stale_manifest() {
 }
 
 #[test]
+fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
+    let dir = unique_temp_dir("sukari-storage-empty-segment-before-manifest");
+    create_two_segment_store(&dir);
+    std::fs::File::create(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME))
+        .expect("empty next segment should be created");
+    write_manifest(
+        &dir,
+        r#"{"version":1,"active_append_segment":"append-000002.segment"}"#,
+    );
+
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(2)
+    );
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
+        .expect("term should be stored in recovered segment");
+    drop(engine);
+
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+    assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
+    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-000003.segment""#));
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(3)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_does_not_validate_log_anchor_before_write() {
     let dir = unique_temp_dir("sukari-storage-raw-append");
     let mut engine =
@@ -1285,6 +1419,27 @@ fn storage_engine_truncates_trailing_partial_record_in_latest_segment() {
             .len(),
         stable_len
     );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rejects_trailing_partial_record_in_inactive_segment() {
+    let dir = unique_temp_dir("sukari-storage-inactive-partial");
+    create_two_segment_store(&dir);
+
+    let path = segment_path(&dir);
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("inactive segment should open");
+    file.write_all(b"SKR1")
+        .expect("partial record should be written");
+    drop(file);
+
+    let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
+        .expect_err("inactive partial segment should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }

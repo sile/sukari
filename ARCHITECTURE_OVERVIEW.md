@@ -285,7 +285,9 @@ paging. If the index is stale, replay scans from the hinted checkpoint record
 forward and can still discover a newer checkpoint.
 
 The active segment tolerates a trailing partial record and truncates it during
-replay. Checksum mismatches are treated as corruption.
+replay. Inactive segments do not tolerate trailing partial records because they
+should have been completed before a later active segment became visible.
+Checksum mismatches are treated as corruption.
 
 ## Memory Model
 
