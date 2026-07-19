@@ -14,8 +14,3 @@
 ## Segment Format
 
 - Document the `SKR1` format once the first release boundary is clear.
-
-## Testing
-
-- Decide whether manifest, registry, and `checkpoints.json` sync ordering need
-  fault-injection tests.
