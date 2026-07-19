@@ -1,7 +1,5 @@
 //! Storage statistics.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 /// Runtime storage counter and gauge snapshot.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StorageStats {
@@ -122,21 +120,21 @@ pub struct OperationKindStats {
 
 #[derive(Debug, Default)]
 pub(crate) struct StorageStatsCounters {
-    records_written: AtomicRecordKindStats,
-    bytes_written: AtomicRecordKindStats,
-    records_replayed: AtomicRecordKindStats,
-    bytes_replayed: AtomicRecordKindStats,
-    segment_rotations: AtomicU64,
-    flushes: AtomicU64,
-    durable_syncs: AtomicU64,
-    replay_truncations: AtomicU64,
-    checksum_failures: AtomicU64,
-    nodes_created: AtomicU64,
-    nodes_removed: AtomicU64,
-    rejected_operations: AtomicRejectedOperationStats,
-    snapshot_checkpoints_saved: AtomicU64,
-    gc_runs: AtomicU64,
-    gc_segments_deleted: AtomicU64,
+    records_written: RecordKindCounters,
+    bytes_written: RecordKindCounters,
+    records_replayed: RecordKindCounters,
+    bytes_replayed: RecordKindCounters,
+    segment_rotations: u64,
+    flushes: u64,
+    durable_syncs: u64,
+    replay_truncations: u64,
+    checksum_failures: u64,
+    nodes_created: u64,
+    nodes_removed: u64,
+    rejected_operations: RejectedOperationCounters,
+    snapshot_checkpoints_saved: u64,
+    gc_runs: u64,
+    gc_segments_deleted: u64,
 }
 
 impl StorageStatsCounters {
@@ -167,74 +165,74 @@ impl StorageStatsCounters {
         }
     }
 
-    pub(crate) fn record_written(&self, kind: RecordKindMetric, bytes: u64) {
+    pub(crate) fn record_written(&mut self, kind: RecordKindMetric, bytes: u64) {
         self.records_written.increment(kind, 1);
         self.bytes_written.increment(kind, bytes);
     }
 
-    pub(crate) fn record_replayed(&self, kind: RecordKindMetric, bytes: u64) {
+    pub(crate) fn record_replayed(&mut self, kind: RecordKindMetric, bytes: u64) {
         self.records_replayed.increment(kind, 1);
         self.bytes_replayed.increment(kind, bytes);
     }
 
-    pub(crate) fn segment_rotated(&self) {
-        increment(&self.segment_rotations, 1);
+    pub(crate) fn segment_rotated(&mut self) {
+        increment(&mut self.segment_rotations, 1);
     }
 
-    pub(crate) fn flushed(&self) {
-        increment(&self.flushes, 1);
+    pub(crate) fn flushed(&mut self) {
+        increment(&mut self.flushes, 1);
     }
 
-    pub(crate) fn durable_synced(&self) {
-        increment(&self.durable_syncs, 1);
+    pub(crate) fn durable_synced(&mut self) {
+        increment(&mut self.durable_syncs, 1);
     }
 
-    pub(crate) fn replay_truncated(&self) {
-        increment(&self.replay_truncations, 1);
+    pub(crate) fn replay_truncated(&mut self) {
+        increment(&mut self.replay_truncations, 1);
     }
 
-    pub(crate) fn checksum_failed(&self) {
-        increment(&self.checksum_failures, 1);
+    pub(crate) fn checksum_failed(&mut self) {
+        increment(&mut self.checksum_failures, 1);
     }
 
-    pub(crate) fn node_created(&self) {
-        increment(&self.nodes_created, 1);
+    pub(crate) fn node_created(&mut self) {
+        increment(&mut self.nodes_created, 1);
     }
 
-    pub(crate) fn node_removed(&self) {
-        increment(&self.nodes_removed, 1);
+    pub(crate) fn node_removed(&mut self) {
+        increment(&mut self.nodes_removed, 1);
     }
 
     pub(crate) fn rejected_operation(
-        &self,
+        &mut self,
         operation: StorageOperationKind,
         error: NodeAccessErrorKind,
     ) {
         self.rejected_operations.increment(operation, error);
     }
 
-    pub(crate) fn snapshot_checkpoint_saved(&self) {
-        increment(&self.snapshot_checkpoints_saved, 1);
+    pub(crate) fn snapshot_checkpoint_saved(&mut self) {
+        increment(&mut self.snapshot_checkpoints_saved, 1);
     }
 
-    pub(crate) fn gc_ran(&self) {
-        increment(&self.gc_runs, 1);
+    pub(crate) fn gc_ran(&mut self) {
+        increment(&mut self.gc_runs, 1);
     }
 
-    pub(crate) fn gc_deleted_segments(&self, count: u64) {
-        increment(&self.gc_segments_deleted, count);
+    pub(crate) fn gc_deleted_segments(&mut self, count: u64) {
+        increment(&mut self.gc_segments_deleted, count);
     }
 }
 
 #[derive(Debug, Default)]
-struct AtomicRecordKindStats {
-    current_term: AtomicU64,
-    voted_for: AtomicU64,
-    log_append: AtomicU64,
-    snapshot_checkpoint: AtomicU64,
+struct RecordKindCounters {
+    current_term: u64,
+    voted_for: u64,
+    log_append: u64,
+    snapshot_checkpoint: u64,
 }
 
-impl AtomicRecordKindStats {
+impl RecordKindCounters {
     fn snapshot(&self) -> RecordKindStats {
         RecordKindStats {
             current_term: load(&self.current_term),
@@ -244,25 +242,25 @@ impl AtomicRecordKindStats {
         }
     }
 
-    fn increment(&self, kind: RecordKindMetric, value: u64) {
+    fn increment(&mut self, kind: RecordKindMetric, value: u64) {
         match kind {
-            RecordKindMetric::CurrentTerm => increment(&self.current_term, value),
-            RecordKindMetric::VotedFor => increment(&self.voted_for, value),
-            RecordKindMetric::LogAppend => increment(&self.log_append, value),
+            RecordKindMetric::CurrentTerm => increment(&mut self.current_term, value),
+            RecordKindMetric::VotedFor => increment(&mut self.voted_for, value),
+            RecordKindMetric::LogAppend => increment(&mut self.log_append, value),
             RecordKindMetric::SnapshotCheckpoint => {
-                increment(&self.snapshot_checkpoint, value);
+                increment(&mut self.snapshot_checkpoint, value);
             }
         }
     }
 }
 
 #[derive(Debug, Default)]
-struct AtomicRejectedOperationStats {
-    unknown_nodes: AtomicOperationKindStats,
-    removed_nodes: AtomicOperationKindStats,
+struct RejectedOperationCounters {
+    unknown_nodes: OperationKindCounters,
+    removed_nodes: OperationKindCounters,
 }
 
-impl AtomicRejectedOperationStats {
+impl RejectedOperationCounters {
     fn snapshot(&self) -> RejectedOperationStats {
         RejectedOperationStats {
             unknown_nodes: self.unknown_nodes.snapshot(),
@@ -270,7 +268,7 @@ impl AtomicRejectedOperationStats {
         }
     }
 
-    fn increment(&self, operation: StorageOperationKind, error: NodeAccessErrorKind) {
+    fn increment(&mut self, operation: StorageOperationKind, error: NodeAccessErrorKind) {
         match error {
             NodeAccessErrorKind::UnknownNode => self.unknown_nodes.increment(operation),
             NodeAccessErrorKind::RemovedNode => self.removed_nodes.increment(operation),
@@ -279,16 +277,16 @@ impl AtomicRejectedOperationStats {
 }
 
 #[derive(Debug, Default)]
-struct AtomicOperationKindStats {
-    load: AtomicU64,
-    save_current_term: AtomicU64,
-    save_voted_for: AtomicU64,
-    append_entries: AtomicU64,
-    save_snapshot: AtomicU64,
-    remove_node: AtomicU64,
+struct OperationKindCounters {
+    load: u64,
+    save_current_term: u64,
+    save_voted_for: u64,
+    append_entries: u64,
+    save_snapshot: u64,
+    remove_node: u64,
 }
 
-impl AtomicOperationKindStats {
+impl OperationKindCounters {
     fn snapshot(&self) -> OperationKindStats {
         OperationKindStats {
             load: load(&self.load),
@@ -300,14 +298,14 @@ impl AtomicOperationKindStats {
         }
     }
 
-    fn increment(&self, operation: StorageOperationKind) {
+    fn increment(&mut self, operation: StorageOperationKind) {
         match operation {
-            StorageOperationKind::Load => increment(&self.load, 1),
-            StorageOperationKind::SaveCurrentTerm => increment(&self.save_current_term, 1),
-            StorageOperationKind::SaveVotedFor => increment(&self.save_voted_for, 1),
-            StorageOperationKind::AppendEntries => increment(&self.append_entries, 1),
-            StorageOperationKind::SaveSnapshot => increment(&self.save_snapshot, 1),
-            StorageOperationKind::RemoveNode => increment(&self.remove_node, 1),
+            StorageOperationKind::Load => increment(&mut self.load, 1),
+            StorageOperationKind::SaveCurrentTerm => increment(&mut self.save_current_term, 1),
+            StorageOperationKind::SaveVotedFor => increment(&mut self.save_voted_for, 1),
+            StorageOperationKind::AppendEntries => increment(&mut self.append_entries, 1),
+            StorageOperationKind::SaveSnapshot => increment(&mut self.save_snapshot, 1),
+            StorageOperationKind::RemoveNode => increment(&mut self.remove_node, 1),
         }
     }
 }
@@ -336,10 +334,10 @@ pub(crate) enum NodeAccessErrorKind {
     RemovedNode,
 }
 
-fn increment(counter: &AtomicU64, value: u64) {
-    counter.fetch_add(value, Ordering::Relaxed);
+fn increment(counter: &mut u64, value: u64) {
+    *counter = (*counter).saturating_add(value);
 }
 
-fn load(counter: &AtomicU64) -> u64 {
-    counter.load(Ordering::Relaxed)
+fn load(counter: &u64) -> u64 {
+    *counter
 }

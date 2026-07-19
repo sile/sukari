@@ -99,7 +99,8 @@ fn storage_engine_persists_node_registry_metadata() {
     );
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .node_metadata(noraft::NodeId::new(1))
@@ -496,7 +497,8 @@ fn storage_engine_ignores_checkpoint_index_for_unregistered_node() {
         .expect("term should be stored");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .node_metadata(noraft::NodeId::new(1))
@@ -580,7 +582,8 @@ fn storage_engine_persists_checkpoint_index_positions() {
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -600,7 +603,8 @@ fn storage_engine_ignores_stale_checkpoint_index_tmp() {
     std::fs::write(dir.join(CHECKPOINT_INDEX_TMP_FILE_NAME), "not-json")
         .expect("stale checkpoint index tmp file should be written");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -765,7 +769,8 @@ fn storage_engine_scans_after_stale_checkpoint_index_hint() {
     drop(engine);
     write_checkpoint_index(&dir, &stale_checkpoint_index);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(1))
         .expect("newer checkpoint should be found after the stale hint");
@@ -811,7 +816,8 @@ fn storage_engine_load_all_falls_back_without_checkpoint_index() {
     std::fs::remove_file(dir.join(CHECKPOINT_INDEX_FILE_NAME))
         .expect("checkpoint index should be removed");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -855,7 +861,8 @@ fn storage_engine_recovers_snapshot_checkpoint_without_checkpoint_index() {
     std::fs::remove_file(dir.join(CHECKPOINT_INDEX_FILE_NAME))
         .expect("checkpoint index should be removed");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(1))
         .expect("node state should load by checkpoint scan");
@@ -966,7 +973,8 @@ fn storage_engine_collects_obsolete_segments_after_checkpoint() {
     assert!(segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1016,7 +1024,8 @@ fn storage_engine_replays_after_incomplete_segment_gc() {
     )
     .expect("obsolete segment should be restored");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert!(segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
     let state = engine
         .load(noraft::NodeId::new(1))
@@ -1086,7 +1095,8 @@ fn storage_engine_uses_initial_checkpoint_barriers_for_gc() {
     assert!(segment_path_named(&dir, FIFTH_SEGMENT_FILE_NAME).exists());
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1148,7 +1158,8 @@ fn storage_engine_does_not_collect_after_node_creation() {
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(2))
@@ -1234,7 +1245,8 @@ fn storage_engine_replays_records_for_multiple_nodes() {
         .expect("node 2 term should be stored");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state1 = engine
         .load(noraft::NodeId::new(1))
         .expect("node 1 state should load");
@@ -1276,7 +1288,8 @@ fn storage_engine_load_skips_other_node_replay_state() {
         .expect("other node append should be stored without consulting current state");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(1))
         .expect("target node should load without applying other node records");
@@ -1320,7 +1333,8 @@ fn storage_engine_rotates_and_replays_append_segments() {
 
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1341,7 +1355,8 @@ fn storage_engine_writes_manifest_for_active_append_segment() {
     assert!(manifest.contains(r#""version": 1"#));
     assert!(manifest.contains(r#""active_append_segment": "append-1.segment""#));
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1361,7 +1376,8 @@ fn storage_engine_ignores_stale_manifest_tmp() {
     std::fs::write(dir.join(MANIFEST_TMP_FILE_NAME), "not-json")
         .expect("stale manifest tmp file should be written");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1379,7 +1395,8 @@ fn storage_engine_falls_back_from_invalid_manifest() {
     create_two_segment_store(&dir);
     write_manifest(&dir, "{");
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1465,7 +1482,8 @@ fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
     assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
     assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1506,7 +1524,8 @@ fn storage_engine_recovers_empty_segment_created_after_manifest_update() {
     assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
     assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(1))
@@ -1580,7 +1599,8 @@ fn storage_engine_replays_snapshots() {
         .expect("snapshot should be stored");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(3))
         .expect("node state should load");
@@ -1652,7 +1672,8 @@ fn storage_engine_replays_snapshot_checkpoints() {
         .expect("later append should be stored");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(3))
         .expect("node state should load");
@@ -1709,7 +1730,8 @@ fn storage_engine_checkpoint_ignores_older_invalid_append() {
         .expect("checkpoint should be stored");
     drop(engine);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     let state = engine
         .load(noraft::NodeId::new(1))
         .expect("checkpoint should supersede the invalid old append");
@@ -1806,7 +1828,8 @@ fn storage_engine_truncates_trailing_partial_record() {
         .expect("partial record should be written");
     drop(file);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(2))
@@ -1850,7 +1873,8 @@ fn storage_engine_truncates_trailing_partial_record_in_latest_segment() {
         .expect("partial record should be written");
     drop(file);
 
-    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
         engine
             .load(noraft::NodeId::new(2))

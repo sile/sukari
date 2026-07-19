@@ -293,7 +293,7 @@ proptest! {
         }
         drop(engine);
 
-        let engine =
+        let mut engine =
             StorageEngine::new(dir.path(), SyncPolicy::UnsafeNoSync).expect("storage should reopen");
         let loaded = engine.load(NODE_ID).expect("node state should load");
         prop_assert_eq!(&loaded, &expected);
