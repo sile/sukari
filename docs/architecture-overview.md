@@ -410,5 +410,5 @@ The current test strategy uses post-crash file-state tests instead of direct
 fault injection. Tests construct states that can be left behind by crashes, such
 as stale temporary metadata files, lost checkpoint index updates, empty segments
 created during rotation, and incomplete whole-segment deletion. This avoids a
-filesystem abstraction layer while the storage API and on-disk format are still
-small and experimental.
+filesystem abstraction layer while the storage API and on-disk format remain
+compact.

@@ -2,8 +2,7 @@
 
 This document specifies the current `sukari` segment record format.
 
-`SKR1` is unstable while the crate is unreleased. Incompatible storage changes
-can still move to a new magic value if keeping experimental data is not useful.
+The current segment magic is `SKR1`.
 
 ## Frame Layout
 
