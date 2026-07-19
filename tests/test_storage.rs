@@ -102,7 +102,7 @@ fn storage_engine_replays_records_for_multiple_nodes() {
         [(2, Bytes::from(b"command".as_slice()))],
     );
     engine
-        .append_entries(noraft::NodeId::new(1), &append)
+        .append_entries(noraft::NodeId::new(1), append)
         .expect("entries should be stored");
 
     engine
@@ -149,7 +149,7 @@ fn storage_engine_replays_snapshots() {
         ],
     );
     engine
-        .append_entries(noraft::NodeId::new(3), &append)
+        .append_entries(noraft::NodeId::new(3), append)
         .expect("entries should be stored");
 
     let snapshot = Snapshot {
@@ -158,7 +158,7 @@ fn storage_engine_replays_snapshots() {
         data: Bytes::from(b"snapshot".as_slice()),
     };
     engine
-        .save_snapshot(noraft::NodeId::new(3), &snapshot)
+        .save_snapshot(noraft::NodeId::new(3), snapshot)
         .expect("snapshot should be stored");
     drop(engine);
 

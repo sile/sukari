@@ -98,21 +98,13 @@ impl StorageEngine {
     }
 
     /// Appends log entries and their command payloads.
-    pub fn append_entries(
-        &mut self,
-        node_id: noraft::NodeId,
-        append: &LogAppend,
-    ) -> io::Result<()> {
-        self.save_record(node_id, Record::Append(append.clone()))
+    pub fn append_entries(&mut self, node_id: noraft::NodeId, append: LogAppend) -> io::Result<()> {
+        self.save_record(node_id, Record::Append(append))
     }
 
     /// Saves a snapshot.
-    pub fn save_snapshot(
-        &mut self,
-        node_id: noraft::NodeId,
-        snapshot: &Snapshot,
-    ) -> io::Result<()> {
-        self.save_record(node_id, Record::Snapshot(snapshot.clone()))
+    pub fn save_snapshot(&mut self, node_id: noraft::NodeId, snapshot: Snapshot) -> io::Result<()> {
+        self.save_record(node_id, Record::Snapshot(snapshot))
     }
 
     /// Records removal of all durable data for the given Raft node.
