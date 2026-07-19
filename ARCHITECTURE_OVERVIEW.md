@@ -14,7 +14,6 @@ The crate should own:
 - deterministic replay
 - per-node replay state
 - rewrite and purge state machines
-- node removal tombstones
 - node registry metadata for storage namespace ownership
 - storage metrics
 - migration tools from per-node WAL if needed
@@ -34,7 +33,7 @@ the storage operations commonly emitted by `noraft`-based runtimes:
 - append log entries and command payloads
 - save latest snapshot state
 - replay a node's persistent state at startup
-- remove all durable data for a removed node
+- mark a node removed and reserve its node ID
 
 The standard architecture treats `noraft::NodeId` values as globally unique.
 `sukari` should therefore route records by node ID. A small node registry may
@@ -107,7 +106,6 @@ The current record kinds are:
 - voted-for node
 - log append
 - snapshot
-- node removal tombstone
 
 `SKR1` is unstable while the crate is unreleased. Incompatible storage changes
 can still move to a new magic value if keeping experimental data is not useful.
@@ -159,7 +157,8 @@ created.
 
 Node IDs are encoded as decimal string keys. The `removed` flag keeps removed
 node IDs reserved, so `create_node()` rejects an ID even after `remove_node()`
-has marked it as removed.
+has marked it as removed. `remove_node()` updates `nodes.json` only; it does not
+append a segment record.
 
 Each node entry should contain a typed `startup` flag and opaque JSON metadata.
 The `startup` flag means the node should be considered during process startup
@@ -186,7 +185,6 @@ in deterministic file-name order, and rebuilds per-node state:
 - log entries
 - command payloads
 - latest snapshot metadata and data or reference
-- node removal tombstones
 
 The first version should not require an on-disk random-read index. Normal reads
 are expected to be rare and mostly limited to startup. If replay becomes too
@@ -217,7 +215,8 @@ Garbage collection is the main complexity of shared storage.
 
 Records for many nodes can be mixed in one segment, so a segment can only be
 deleted when all records in that segment are obsolete. Snapshot progress for one
-node is not sufficient by itself.
+node is not sufficient by itself. Removed nodes are identified from `nodes.json`;
+the segment stream does not contain node removal records.
 
 The engine will need one or more of these mechanisms:
 
@@ -239,7 +238,6 @@ The storage format needs explicit recovery rules for:
 - rewrite segment creation
 - rewrite completion
 - old segment deletion
-- node removal tombstones
 - atomic replacement of `nodes.json`
 - process crash after fsyncing records before updating manifests
 

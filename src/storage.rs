@@ -129,9 +129,7 @@ impl StorageEngine {
         )?;
         let mut nodes = BTreeMap::new();
         for node_id in active_node_ids {
-            if !replay.removed_nodes.contains(&node_id) {
-                nodes.insert(node_id, replay.nodes.remove(&node_id).unwrap_or_default());
-            }
+            nodes.insert(node_id, replay.nodes.remove(&node_id).unwrap_or_default());
         }
         Ok(nodes)
     }
@@ -164,13 +162,13 @@ impl StorageEngine {
         self.save_record(node_id, Record::Snapshot(snapshot))
     }
 
-    /// Records removal of all durable data for the given Raft node.
+    /// Marks the given Raft node as removed and reserves its node ID.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
         let mut registry = self.registry.clone();
         registry.remove_node(node_id)?;
         registry.save(&self.dir, self.sync)?;
         self.registry = registry;
-        self.writer.append(node_id, &Record::NodeRemoved)
+        Ok(())
     }
 
     /// Flushes pending writes.
@@ -496,7 +494,6 @@ enum Record {
     VotedFor(Option<noraft::NodeId>),
     Append(LogAppend),
     Snapshot(Snapshot),
-    NodeRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,51 +616,13 @@ struct SegmentPath {
 #[derive(Debug, Default)]
 struct ReplayState {
     nodes: BTreeMap<noraft::NodeId, StorageState>,
-    removed_nodes: BTreeSet<noraft::NodeId>,
 }
 
 impl ReplayState {
     fn apply(&mut self, node_record: NodeRecord) -> io::Result<()> {
         let NodeRecord { node_id, record } = node_record;
-        match record {
-            Record::NodeRemoved => {
-                self.nodes.remove(&node_id);
-                self.removed_nodes.insert(node_id);
-                Ok(())
-            }
-            _ if self.removed_nodes.contains(&node_id) => Ok(()),
-            record => {
-                let state = self.nodes.entry(node_id).or_default();
-                apply_record_to_state(state, record)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct NodeReplayState {
-    state: StorageState,
-    removed: bool,
-}
-
-impl NodeReplayState {
-    fn apply(&mut self, record: Record) -> io::Result<()> {
-        match record {
-            Record::NodeRemoved => {
-                self.state = StorageState::default();
-                self.removed = true;
-                Ok(())
-            }
-            _ if self.removed => Ok(()),
-            record => apply_record_to_state(&mut self.state, record),
-        }
-    }
-
-    fn into_storage_state(self) -> io::Result<StorageState> {
-        if self.removed {
-            return Err(node_removed_error());
-        }
-        Ok(self.state)
+        let state = self.nodes.entry(node_id).or_default();
+        apply_record_to_state(state, record)
     }
 }
 
@@ -679,7 +638,6 @@ fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result
         }
         Record::Append(append) => state.apply_append_owned(append),
         Record::Snapshot(snapshot) => state.apply_snapshot(snapshot),
-        Record::NodeRemoved => Ok(()),
     }
 }
 
@@ -688,12 +646,12 @@ fn replay_node_state(
     active_segment: SegmentName,
     node_id: noraft::NodeId,
 ) -> io::Result<StorageState> {
-    let mut replay = NodeReplayState::default();
+    let mut state = StorageState::default();
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        replay_node_segment(&segment.path, allow_partial, node_id, &mut replay)?;
+        replay_node_segment(&segment.path, allow_partial, node_id, &mut state)?;
     }
-    replay.into_storage_state()
+    Ok(state)
 }
 
 fn replay_storage_dir(
@@ -781,7 +739,7 @@ fn replay_node_segment(
     path: &Path,
     allow_partial: bool,
     target_node_id: noraft::NodeId,
-    replay: &mut NodeReplayState,
+    state: &mut StorageState,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -805,7 +763,7 @@ fn replay_node_segment(
         };
 
         if decode_record_node_id(&body)? == target_node_id {
-            replay.apply(decode_node_record(&body)?.record)?;
+            apply_record_to_state(state, decode_node_record(&body)?.record)?;
         }
     }
 
@@ -1015,7 +973,6 @@ fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
             encoder.put_u8(3);
             encode_snapshot(snapshot, encoder)?;
         }
-        Record::NodeRemoved => encoder.put_u8(4),
     }
     Ok(())
 }
@@ -1028,7 +985,6 @@ fn decode_node_record(bytes: &[u8]) -> io::Result<NodeRecord> {
         1 => Record::VotedFor(decode_optional_node_id(&mut decoder)?),
         2 => Record::Append(decode_log_append(&mut decoder)?),
         3 => Record::Snapshot(decode_snapshot(&mut decoder)?),
-        4 => Record::NodeRemoved,
         _ => return Err(invalid_data("unknown segment record tag")),
     };
     decoder.finish()?;

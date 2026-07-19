@@ -425,7 +425,7 @@ fn storage_engine_replays_snapshots() {
 }
 
 #[test]
-fn storage_engine_tombstone_hides_removed_node() {
+fn storage_engine_registry_hides_removed_node() {
     let dir = unique_temp_dir("sukari-storage-remove");
     let mut engine =
         StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
@@ -433,10 +433,19 @@ fn storage_engine_tombstone_hides_removed_node() {
     engine
         .save_current_term(noraft::NodeId::new(5), noraft::Term::new(8))
         .expect("term should be stored");
+    let segment_len_after_term = std::fs::metadata(segment_path(&dir))
+        .expect("segment should exist")
+        .len();
 
     engine
         .remove_node(noraft::NodeId::new(5))
-        .expect("node tombstone should be stored");
+        .expect("node should be removed");
+    assert_eq!(
+        std::fs::metadata(segment_path(&dir))
+            .expect("segment should exist")
+            .len(),
+        segment_len_after_term
+    );
 
     let all = engine.load_all().expect("states should load");
     assert!(!all.contains_key(&noraft::NodeId::new(5)));

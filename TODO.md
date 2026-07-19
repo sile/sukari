@@ -10,7 +10,6 @@
 
 - Decide whether loaded command and snapshot payloads should stay as `Vec<u8>`
   wrappers or move to a shared representation.
-- Revisit node tombstone behavior after the first runtime integration.
 
 ## Segment Format
 
