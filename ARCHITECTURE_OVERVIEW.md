@@ -15,6 +15,7 @@ The crate should own:
 - per-node replay state
 - rewrite and purge state machines
 - node removal tombstones
+- node registry metadata for storage namespace ownership
 - storage metrics
 - migration tools from per-node WAL if needed
 
@@ -36,8 +37,11 @@ the storage operations commonly emitted by `noraft`-based runtimes:
 - remove all durable data for a removed node
 
 The standard architecture treats `noraft::NodeId` values as globally unique.
-`sukari` should therefore route records by node ID. Cluster and group metadata
-should stay in the control plane above the storage layer.
+`sukari` should therefore route records by node ID. A small node registry may
+belong in this crate so the storage layer can define which node IDs exist in a
+storage instance and so a process can discover startup nodes before loading an
+external control plane. Cluster membership, group placement, and orchestration
+state should stay in the control plane above the storage layer.
 
 ## Current Baseline
 
@@ -106,11 +110,44 @@ The intended full design is a shared segmented append-only design:
 
 ```text
 storage/
+  nodes.json
   manifest
   append-000001.segment
   append-000002.segment
   rewrite-000010.segment
 ```
+
+## Node Registry
+
+The intended design includes a small JSON node registry file:
+
+```text
+storage/
+  nodes.json
+  append-000001.segment
+  append-000002.segment
+```
+
+The registry records which `noraft::NodeId` values are valid for this storage
+instance. Nodes are added with `create_node()` and removed with `remove_node()`.
+Storage operations such as `load()`, `save_current_term()`, `save_voted_for()`,
+`append_entries()`, and `save_snapshot()` should fail for node IDs that have not
+been created.
+
+Each node entry should contain a typed `startup` flag and opaque JSON metadata.
+The `startup` flag means the node should be considered during process startup
+before any external control plane has been loaded. The metadata JSON is
+application-defined and should be stored and returned without interpretation by
+`sukari`. The JSON representation should use the `nojson` crate.
+
+`nodes.json` should contain all node entries in one small file and be updated by
+atomic replacement. The update protocol should write a temporary file, sync it,
+rename it over `nodes.json`, and sync the parent directory when the sync policy
+requires durable metadata.
+
+The registry is a storage namespace and startup-discovery mechanism. It is not
+the authoritative Raft cluster membership, group placement, or orchestration
+state; those belong to the control plane above `sukari`.
 
 ## Replay
 
@@ -176,6 +213,7 @@ The storage format needs explicit recovery rules for:
 - rewrite completion
 - old segment deletion
 - node removal tombstones
+- atomic replacement of `nodes.json`
 - process crash after fsyncing records before updating manifests
 
 The manifest should accelerate discovery, not be the only source of truth,
