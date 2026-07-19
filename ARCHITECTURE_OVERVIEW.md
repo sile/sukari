@@ -293,17 +293,20 @@ Checksum mismatches are treated as corruption.
 
 `StorageEngine` should not keep fully replayed node state in memory for normal
 writes. Opening the engine may scan segment frames for recovery, but full
-`StorageState` construction should happen only when loading state. `load()`
+`NodeState` construction should happen only when loading state. `load()`
 constructs the requested node state, while `load_all()` constructs all
 non-removed node states.
 
 The initial design assumes that the loaded snapshot payload and the log entries
-after that snapshot fit comfortably in memory. This keeps the storage API simple
-and matches the expected Raft usage. Very large snapshots and large blob
-payloads are poor fits for Raft and are not target use cases. Random-read log
-paging is also not a target use case. Lagging-node catch-up should read the
-already loaded log suffix from memory; synchronous disk reads can block leader
-replication, while asynchronous paging complicates the runtime for little gain.
+after that snapshot fit comfortably in memory. Payload bytes are stored in a
+reference-counted `Bytes` wrapper so cloning loaded command and snapshot
+payloads is cheap, but the bytes themselves are still expected to fit in memory.
+This keeps the storage API simple and matches the expected Raft usage. Very
+large snapshots and large blob payloads are poor fits for Raft and are not
+target use cases. Random-read log paging is also not a target use case.
+Lagging-node catch-up should read the already loaded log suffix from memory;
+synchronous disk reads can block leader replication, while asynchronous paging
+complicates the runtime for little gain.
 
 ## Compaction And Garbage Collection
 
