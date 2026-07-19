@@ -130,6 +130,45 @@ fn storage_engine_replays_records_for_multiple_nodes() {
 }
 
 #[test]
+fn storage_engine_load_skips_other_node_replay_state() {
+    let dir = unique_temp_dir("sukari-storage-targeted-load");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(4))
+        .expect("term should be stored");
+
+    let invalid_append = append(
+        position(9, 9),
+        [noraft::LogEntry::Term(noraft::Term::new(10))],
+        [],
+    );
+    engine
+        .append_entries(noraft::NodeId::new(2), invalid_append)
+        .expect("other node append should be stored without consulting current state");
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let state = engine
+        .load(noraft::NodeId::new(1))
+        .expect("target node should load without applying other node records");
+    assert_eq!(state.current_term, noraft::Term::new(4));
+
+    let err = engine
+        .load(noraft::NodeId::new(2))
+        .expect_err("invalid target node replay should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    let err = engine
+        .load_all()
+        .expect_err("loading all nodes should apply the invalid node record");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_rotates_and_replays_append_segments() {
     let dir = unique_temp_dir("sukari-storage-rotate");
     let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)

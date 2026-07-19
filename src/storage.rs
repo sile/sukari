@@ -79,11 +79,7 @@ impl StorageEngine {
 
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
-        let mut replay = replay_storage_dir(&self.dir, self.writer.active_segment)?;
-        if replay.removed_nodes.contains(&node_id) {
-            return Err(node_removed_error());
-        }
-        Ok(replay.nodes.remove(&node_id).unwrap_or_default())
+        replay_node_state(&self.dir, self.writer.active_segment, node_id)
     }
 
     /// Loads the latest state of all non-removed nodes.
@@ -581,6 +577,33 @@ impl ReplayState {
     }
 }
 
+#[derive(Debug, Default)]
+struct NodeReplayState {
+    state: StorageState,
+    removed: bool,
+}
+
+impl NodeReplayState {
+    fn apply(&mut self, record: Record) -> io::Result<()> {
+        match record {
+            Record::NodeRemoved => {
+                self.state = StorageState::default();
+                self.removed = true;
+                Ok(())
+            }
+            _ if self.removed => Ok(()),
+            record => apply_record_to_state(&mut self.state, record),
+        }
+    }
+
+    fn into_storage_state(self) -> io::Result<StorageState> {
+        if self.removed {
+            return Err(node_removed_error());
+        }
+        Ok(self.state)
+    }
+}
+
 fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result<()> {
     match record {
         Record::CurrentTerm(term) => {
@@ -595,6 +618,19 @@ fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result
         Record::Snapshot(snapshot) => state.apply_snapshot(snapshot),
         Record::NodeRemoved => Ok(()),
     }
+}
+
+fn replay_node_state(
+    dir: &Path,
+    active_segment: SegmentName,
+    node_id: noraft::NodeId,
+) -> io::Result<StorageState> {
+    let mut replay = NodeReplayState::default();
+    for segment in discover_segment_paths(dir)? {
+        let allow_partial = segment.name == active_segment;
+        replay_node_segment(&segment.path, allow_partial, node_id, &mut replay)?;
+    }
+    replay.into_storage_state()
 }
 
 fn replay_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<ReplayState> {
@@ -661,6 +697,41 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
             return Err(invalid_data("partial record in inactive segment"));
         };
         replay.apply(record)?;
+    }
+
+    Ok(())
+}
+
+fn replay_node_segment(
+    path: &Path,
+    allow_partial: bool,
+    target_node_id: noraft::NodeId,
+    replay: &mut NodeReplayState,
+) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(allow_partial)
+        .open(path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let file_len = file.metadata()?.len();
+
+    loop {
+        let record_start = file.stream_position()?;
+        let Some(body) = read_record_body(&mut file)? else {
+            if record_start == file_len {
+                break;
+            }
+            if allow_partial {
+                file.set_len(record_start)?;
+                file.seek(SeekFrom::Start(record_start))?;
+                break;
+            }
+            return Err(invalid_data("partial record in inactive segment"));
+        };
+
+        if decode_record_node_id(&body)? == target_node_id {
+            replay.apply(decode_node_record(&body)?.record)?;
+        }
     }
 
     Ok(())
@@ -809,6 +880,13 @@ fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<V
 }
 
 fn read_record(file: &mut File) -> io::Result<Option<NodeRecord>> {
+    let Some(body) = read_record_body(file)? else {
+        return Ok(None);
+    };
+    decode_node_record(&body).map(Some)
+}
+
+fn read_record_body(file: &mut File) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0; SEGMENT_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
         Ok(()) => {}
@@ -848,7 +926,7 @@ fn read_record(file: &mut File) -> io::Result<Option<NodeRecord>> {
     if actual_checksum != expected_checksum {
         return Err(invalid_data("segment record checksum mismatch"));
     }
-    decode_node_record(&body).map(Some)
+    Ok(Some(body))
 }
 
 fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
@@ -887,6 +965,11 @@ fn decode_node_record(bytes: &[u8]) -> io::Result<NodeRecord> {
     };
     decoder.finish()?;
     Ok(NodeRecord { node_id, record })
+}
+
+fn decode_record_node_id(bytes: &[u8]) -> io::Result<noraft::NodeId> {
+    let mut decoder = Decoder::new(bytes);
+    decode_node_id(&mut decoder)
 }
 
 fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()> {

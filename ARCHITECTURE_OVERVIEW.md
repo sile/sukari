@@ -135,8 +135,9 @@ replay. Checksum mismatches are treated as corruption.
 
 `StorageEngine` should not keep fully replayed node state in memory for normal
 writes. Opening the engine may scan segment frames for recovery, but full
-`StorageState` construction should happen when `load()` or `load_all()` is
-called.
+`StorageState` construction should happen only when loading state. `load()`
+constructs the requested node state, while `load_all()` constructs all
+non-removed node states.
 
 The initial design assumes that the loaded snapshot payload and the log entries
 after that snapshot fit comfortably in memory. This keeps the storage API simple
