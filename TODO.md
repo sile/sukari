@@ -36,5 +36,6 @@
 - Expand focused unit tests for explicit error paths.
 - Add property-based tests for record encoding and replay round trips.
 - Add fuzzing for arbitrary segment input.
-- Add crash-recovery tests for `nodes.json`, manifest, segment rotation,
-  rewrite completion, and deletion ordering.
+- Add crash-recovery tests for manifest, segment rotation, rewrite completion,
+  and deletion ordering.
+- Decide whether registry sync ordering needs fault-injection tests.

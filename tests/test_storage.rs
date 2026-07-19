@@ -11,6 +11,8 @@ use std::{
 const SEGMENT_FILE_NAME: &str = "append-000001.segment";
 const SECOND_SEGMENT_FILE_NAME: &str = "append-000002.segment";
 const THIRD_SEGMENT_FILE_NAME: &str = "append-000003.segment";
+const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
+const NODE_REGISTRY_TMP_FILE_NAME: &str = "nodes.json.tmp";
 const SEGMENT_HEADER_LEN: u64 = 12;
 
 #[test]
@@ -160,6 +162,67 @@ fn storage_engine_reserves_removed_node_ids() {
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_ignores_stale_node_registry_tmp() {
+    let dir = unique_temp_dir("sukari-storage-stale-registry-tmp");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    let metadata = node_metadata(true, r#"{"role":"control"}"#);
+    engine
+        .create_node(noraft::NodeId::new(1), metadata.clone())
+        .expect("node should be created");
+    drop(engine);
+
+    std::fs::write(dir.join(NODE_REGISTRY_TMP_FILE_NAME), "not-json")
+        .expect("stale registry tmp file should be written");
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .node_metadata(noraft::NodeId::new(1))
+            .expect("metadata should come from nodes.json"),
+        &metadata
+    );
+    assert_eq!(engine.node_metadata(noraft::NodeId::new(2)), None);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rejects_invalid_node_registry_files() {
+    for (name, text) in [
+        ("malformed", "{"),
+        ("unsupported-version", r#"{"version":2,"nodes":{}}"#),
+        ("missing-version", r#"{"nodes":{}}"#),
+        ("missing-nodes", r#"{"version":1}"#),
+        (
+            "invalid-node-id",
+            r#"{"version":1,"nodes":{"abc":{"startup":false,"metadata":{},"removed":false}}}"#,
+        ),
+        (
+            "missing-startup",
+            r#"{"version":1,"nodes":{"1":{"metadata":{},"removed":false}}}"#,
+        ),
+        (
+            "missing-metadata",
+            r#"{"version":1,"nodes":{"1":{"startup":false,"removed":false}}}"#,
+        ),
+        (
+            "missing-removed",
+            r#"{"version":1,"nodes":{"1":{"startup":false,"metadata":{}}}}"#,
+        ),
+    ] {
+        let dir = unique_temp_dir(&format!("sukari-storage-invalid-registry-{name}"));
+        write_node_registry(&dir, text);
+
+        let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
+            .expect_err("invalid registry should fail to load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "case: {name}");
+
+        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+    }
 }
 
 #[test]
@@ -636,6 +699,12 @@ fn segment_path(dir: &Path) -> PathBuf {
 
 fn segment_path_named(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(file_name)
+}
+
+fn write_node_registry(dir: &Path, text: &str) {
+    std::fs::create_dir_all(dir).expect("temporary directory should be created");
+    std::fs::write(dir.join(NODE_REGISTRY_FILE_NAME), text)
+        .expect("node registry should be written");
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

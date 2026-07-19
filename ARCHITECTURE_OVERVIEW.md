@@ -169,7 +169,14 @@ raw JSON value without interpreting it.
 `nodes.json` contains all node entries in one small file and is updated by
 atomic replacement. The update protocol writes `nodes.json.tmp`, syncs it,
 renames it over `nodes.json`, and syncs the parent directory when the sync
-policy requires durable metadata.
+policy requires durable metadata. Startup only reads `nodes.json`; a stale
+`nodes.json.tmp` is ignored. If `nodes.json` exists but is malformed or violates
+the registry schema, opening `StorageEngine` fails with `InvalidData`.
+
+`remove_node()` persists removal by the same atomic `nodes.json` replacement.
+A crash before the rename leaves the previous registry authoritative. A crash
+after the rename makes the `removed` flag authoritative. There is no second
+segment append step for node removal.
 
 The registry is a storage namespace and startup-discovery mechanism. It is not
 the authoritative Raft cluster membership, group placement, or orchestration
@@ -238,7 +245,7 @@ The storage format needs explicit recovery rules for:
 - rewrite segment creation
 - rewrite completion
 - old segment deletion
-- atomic replacement of `nodes.json`
+- stale `nodes.json.tmp` after registry update
 - process crash after fsyncing records before updating manifests
 
 The manifest should accelerate discovery, not be the only source of truth,
