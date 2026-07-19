@@ -17,6 +17,9 @@ const SEGMENT_CHECKSUM_LEN: usize = 4;
 const SEGMENT_HEADER_LEN: usize = SEGMENT_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
 const SEGMENT_FILE_SUFFIX: &str = ".segment";
 const SEGMENT_ID_WIDTH: usize = 6;
+const MANIFEST_FILE_NAME: &str = "manifest";
+const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
+const MANIFEST_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
@@ -234,6 +237,7 @@ impl SegmentWriter {
             sync_parent_dir(&segment_path)?;
         }
         let segment_len = file.seek(SeekFrom::End(0))?;
+        Manifest::active_append(active_segment).save(dir, sync)?;
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -280,6 +284,7 @@ impl SegmentWriter {
         if should_sync_metadata(self.sync) {
             sync_parent_dir(&segment_path)?;
         }
+        Manifest::active_append(next_segment).save(&self.dir, self.sync)?;
 
         self.active_segment = next_segment;
         self.file = file;
@@ -582,6 +587,10 @@ impl SegmentName {
         Some(Self { kind, id })
     }
 
+    fn parse_str(s: &str) -> Option<Self> {
+        Self::parse_file_name(OsStr::new(s))
+    }
+
     fn path(self, dir: &Path) -> PathBuf {
         dir.join(self.file_name())
     }
@@ -598,19 +607,144 @@ impl SegmentName {
 }
 
 fn select_active_append_segment(dir: &Path) -> io::Result<SegmentName> {
-    let active_segment = discover_segment_paths(dir)?
+    let hinted_active_segment = match Manifest::load_advisory(dir)? {
+        Some(manifest) => {
+            select_active_append_segment_from_hint(dir, manifest.active_append_segment)?
+        }
+        None => None,
+    };
+    if let Some(active_segment) = hinted_active_segment {
+        return Ok(active_segment);
+    }
+    select_active_append_segment_by_scan(dir)
+}
+
+fn select_active_append_segment_from_hint(
+    dir: &Path,
+    hinted_segment: SegmentName,
+) -> io::Result<Option<SegmentName>> {
+    if !segment_file_exists(dir, hinted_segment)? {
+        return Ok(None);
+    }
+
+    let mut active_segment = hinted_segment;
+    loop {
+        let next_segment = active_segment.next_append()?;
+        if !segment_file_exists(dir, next_segment)? {
+            return Ok(Some(active_segment));
+        }
+        active_segment = next_segment;
+    }
+}
+
+fn select_active_append_segment_by_scan(dir: &Path) -> io::Result<SegmentName> {
+    Ok(discover_segment_paths(dir)?
         .into_iter()
         .map(|segment| segment.name)
         .filter(|segment| segment.kind == SegmentKind::Append)
         .max()
-        .unwrap_or_else(SegmentName::first_append);
-    Ok(active_segment)
+        .unwrap_or_else(SegmentName::first_append))
+}
+
+fn segment_file_exists(dir: &Path, name: SegmentName) -> io::Result<bool> {
+    match std::fs::metadata(name.path(dir)) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug)]
 struct SegmentPath {
     name: SegmentName,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Manifest {
+    active_append_segment: SegmentName,
+}
+
+impl Manifest {
+    fn active_append(active_append_segment: SegmentName) -> Self {
+        debug_assert_eq!(active_append_segment.kind, SegmentKind::Append);
+        Self {
+            active_append_segment,
+        }
+    }
+
+    fn load_advisory(dir: &Path) -> io::Result<Option<Self>> {
+        let path = dir.join(MANIFEST_FILE_NAME);
+        let mut text = String::new();
+        match File::open(path) {
+            Ok(mut file) => {
+                file.read_to_string(&mut text)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+
+        let Ok(json) = nojson::RawJsonOwned::parse(text) else {
+            return Ok(None);
+        };
+        Ok(parse_manifest(json.value()).ok())
+    }
+
+    fn save(self, dir: &Path, sync: SyncPolicy) -> io::Result<()> {
+        let path = dir.join(MANIFEST_FILE_NAME);
+        let tmp_path = dir.join(MANIFEST_TMP_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(format_manifest(self).as_bytes())?;
+        if should_sync_metadata(sync) {
+            file.sync_all()?;
+        }
+        drop(file);
+
+        std::fs::rename(&tmp_path, &path)?;
+        if should_sync_metadata(sync) {
+            sync_dir(dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_manifest(value: nojson::RawJsonValue<'_, '_>) -> Result<Manifest, nojson::JsonParseError> {
+    let version_value = value.to_member("version")?.required()?;
+    let version: u64 = version_value.try_into()?;
+    if version != MANIFEST_VERSION {
+        return Err(version_value.invalid("unsupported manifest version"));
+    }
+
+    let active_segment_value = value.to_member("active_append_segment")?.required()?;
+    let active_segment_name: String = active_segment_value.try_into()?;
+    let active_append_segment = SegmentName::parse_str(&active_segment_name)
+        .ok_or_else(|| active_segment_value.invalid("invalid active append segment name"))?;
+    if active_append_segment.kind != SegmentKind::Append {
+        return Err(active_segment_value.invalid("active segment must be an append segment"));
+    }
+
+    Ok(Manifest::active_append(active_append_segment))
+}
+
+fn format_manifest(manifest: Manifest) -> String {
+    let mut text = nojson::json(|f| {
+        f.set_indent_size(2);
+        f.set_spacing(true);
+        f.object(|f| {
+            f.member("version", MANIFEST_VERSION)?;
+            f.member(
+                "active_append_segment",
+                manifest.active_append_segment.file_name(),
+            )
+        })
+    })
+    .to_string();
+    text.push('\n');
+    text
 }
 
 #[derive(Debug, Default)]

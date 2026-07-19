@@ -14,14 +14,12 @@
 ## Segment Format
 
 - Document the `SKR1` format once the first release boundary is clear.
-- Add manifest-backed active segment selection.
-- Define manifest format and whether it is authoritative or advisory.
 - Define rewrite segment ordering and completion records.
 
 ## Replay
 
 - Validate replay behavior when both append and rewrite segments exist.
-- Add manifest-assisted replay once the manifest format exists.
+- Decide which replay hints belong in the manifest after rewrite segments exist.
 - Decide whether inactive segments should ever tolerate trailing partial records.
 
 ## Compaction And Garbage Collection
@@ -36,6 +34,6 @@
 - Expand focused unit tests for explicit error paths.
 - Add property-based tests for record encoding and replay round trips.
 - Add fuzzing for arbitrary segment input.
-- Add crash-recovery tests for manifest, segment rotation, rewrite completion,
-  and deletion ordering.
-- Decide whether registry sync ordering needs fault-injection tests.
+- Add crash-recovery tests for segment rotation, rewrite completion, and
+  deletion ordering.
+- Decide whether manifest and registry sync ordering need fault-injection tests.

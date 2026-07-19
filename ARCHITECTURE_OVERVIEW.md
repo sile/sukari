@@ -50,15 +50,20 @@ one active shared append segment at a time:
 ```text
 storage/
   nodes.json
+  manifest
   append-000001.segment
   append-000002.segment
 ```
 
 Segment file names are parsed into internal segment names with a segment kind
-and non-zero numeric segment ID. Startup selects the highest-numbered append
-segment as the active segment. New writes rotate to the next append segment when
-the configured segment length would be exceeded. A single record that exceeds
-the limit is written to an empty segment by itself.
+and non-zero numeric segment ID. Startup reads an advisory manifest when it is
+available, validates the hinted active append segment against existing segment
+files, and follows any subsequent contiguous append segment files before opening
+the writer. Startup falls back to a file-name scan when the manifest is missing,
+malformed, unsupported, names a rewrite segment, or points at a non-existent
+segment. New writes rotate to the next append segment when the configured
+segment length would be exceeded. A single record that exceeds the limit is
+written to an empty segment by itself.
 
 The public API exposes node ID based storage operations on a single engine
 writer:
@@ -182,6 +187,30 @@ The registry is a storage namespace and startup-discovery mechanism. It is not
 the authoritative Raft cluster membership, group placement, or orchestration
 state; those belong to the control plane above `sukari`.
 
+## Manifest
+
+The current implementation stores a small advisory JSON manifest file:
+
+```json
+{
+  "version": 1,
+  "active_append_segment": "append-000002.segment"
+}
+```
+
+The manifest accelerates active append segment selection, but it is not
+authoritative. Startup ignores `manifest.tmp`. If `manifest` is missing,
+malformed, has an unsupported version, names a rewrite segment, or points at a
+non-existent segment, startup falls back to scanning segment file names. If the
+hint names an older existing append segment, startup advances through subsequent
+contiguous append segment file names instead of trusting the old hint as-is.
+
+Segment rotation creates the next append segment first, syncs the segment file
+metadata when required by the sync policy, and then atomically replaces
+`manifest` through `manifest.tmp`. A crash before the rename leaves the old
+manifest in place. A crash after the rename records the new hint. Recovery must
+still discover segment files and must not depend only on the manifest.
+
 ## Replay
 
 Startup discovers `append-*.segment` and `rewrite-*.segment` files, replays them
@@ -240,13 +269,10 @@ The storage format needs explicit recovery rules for:
 
 - partial record at the end of the active segment
 - checksum mismatch
-- manifest update after segment creation
+- stale `manifest` or `manifest.tmp` after segment creation
 - segment rotation
 - rewrite segment creation
 - rewrite completion
 - old segment deletion
 - stale `nodes.json.tmp` after registry update
 - process crash after fsyncing records before updating manifests
-
-The manifest should accelerate discovery, not be the only source of truth,
-unless its update protocol is very carefully specified.
