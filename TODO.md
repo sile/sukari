@@ -18,11 +18,13 @@
 ## Replay
 
 - Decide whether inactive segments should ever tolerate trailing partial records.
+- Consider whether `load_all()` should use `checkpoints.json` hints instead of
+  scanning all segments for checkpoint records.
 
 ## Compaction And Garbage Collection
 
-- Define the `gc.json` schema and atomic update protocol.
-- Implement automatic whole-segment garbage collection.
+- Implement automatic whole-segment garbage collection using
+  `checkpoints.json` barriers.
 - Define `GcPolicy` thresholds for opportunistic deletion.
 - Define old segment deletion and directory sync ordering.
 
@@ -32,6 +34,6 @@
 - Add property-based tests for record encoding and replay round trips.
 - Add fuzzing for arbitrary segment input.
 - Add crash-recovery tests for segment rotation, checkpoint persistence,
-  `gc.json` updates, and segment deletion ordering.
-- Decide whether manifest, registry, and `gc.json` sync ordering need
+  `checkpoints.json` updates, and segment deletion ordering.
+- Decide whether manifest, registry, and `checkpoints.json` sync ordering need
   fault-injection tests.

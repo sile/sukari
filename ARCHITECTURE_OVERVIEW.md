@@ -125,7 +125,7 @@ The intended full design is a shared segmented append-only design:
 storage/
   nodes.json
   manifest
-  gc.json
+  checkpoints.json
   append-000001.segment
   append-000002.segment
 ```
@@ -244,6 +244,12 @@ suffix or append them again after the checkpoint has been saved. Replay may
 ignore older records for the same node once it sees a valid checkpoint. The
 checkpoint suffix should start at the snapshot's last included position.
 
+`save_snapshot()` also updates `checkpoints.json` with the segment name and
+record offset of the checkpoint record. When the sync policy requires durable
+metadata, the checkpoint record is flushed before `checkpoints.json` is
+replaced. This ordering can leave the index stale after a crash, but it should
+not point at a checkpoint record that was never made durable.
+
 ## Replay
 
 Startup discovers `append-*.segment` files, replays them in deterministic
@@ -255,9 +261,13 @@ file-name order, and rebuilds per-node state:
 - command payloads
 - latest snapshot metadata and data or reference
 
-The first version should not require an on-disk random-read index. Normal reads
-are expected to be rare and mostly limited to startup. If replay becomes too
-slow, a manifest or hint file can be added later as an accelerator.
+The first version should not require an on-disk random-read log index. Normal
+reads are expected to be rare and mostly limited to startup. `checkpoints.json`
+is only a checkpoint index: `load(node_id)` can use it as a hint to skip
+segments before the latest known checkpoint, but it is not a general random-read
+index for log paging. If the index is missing, replay falls back to scanning
+segments. If the index is stale, replay scans from the hinted checkpoint record
+forward and can still discover a newer checkpoint.
 
 The active segment tolerates a trailing partial record and truncates it during
 replay. Checksum mismatches are treated as corruption.
@@ -298,35 +308,40 @@ older segments because that node may still need records before its first
 snapshot checkpoint. Removed nodes do not participate in the minimum barrier
 calculation.
 
-The checkpoint barriers should be stored in a separate authoritative JSON file:
+The current implementation stores latest checkpoint locations in a separate
+authoritative JSON file, `checkpoints.json`:
 
 ```json
 {
   "version": 1,
   "nodes": {
     "1": {
-      "checkpoint_segment": "append-000010.segment"
+      "checkpoint_segment": "append-000010.segment",
+      "checkpoint_offset": 1234
     },
     "2": {
-      "checkpoint_segment": "append-000008.segment"
+      "checkpoint_segment": "append-000008.segment",
+      "checkpoint_offset": 0
     }
   }
 }
 ```
 
 This file should be separate from `manifest`. The manifest is advisory and can
-be ignored when it is stale or malformed. `gc.json` controls deletion and is
-therefore authoritative. If `gc.json` is missing, the engine should behave as if
-no checkpoint barriers exist and should not delete old segments. If `gc.json`
-exists but is malformed, violates the schema, names a non-append segment, or
-points at a non-existent checkpoint segment, opening the engine should fail with
-`InvalidData`.
+be ignored when it is stale or malformed. `checkpoints.json` is authoritative
+for future deletion and useful as a replay hint. If `checkpoints.json` is
+missing, the engine behaves as if no checkpoint barriers exist. If it exists but
+is malformed, violates the schema, names a non-append segment, points at a
+non-existent segment, or points at an offset that is not a checkpoint record for
+the target node, opening the engine fails with `InvalidData`. Entries for
+well-formed entries for removed or unknown nodes are ignored on open, and
+`remove_node()` removes the node from the checkpoint index.
 
-`gc.json` should be updated by atomic replacement. A checkpoint update should
-append and durably sync the checkpoint record first when the sync policy
-requires it. Then it should write `gc.json.tmp`, sync it when durable metadata is
-required, rename it over `gc.json`, and sync the parent directory when durable
-metadata is required. A stale `gc.json.tmp` is ignored.
+`checkpoints.json` is updated by atomic replacement. A checkpoint update appends
+and durably syncs the checkpoint record first when the sync policy requires it.
+Then it writes `checkpoints.json.tmp`, syncs it when durable metadata is
+required, renames it over `checkpoints.json`, and syncs the parent directory
+when durable metadata is required. A stale `checkpoints.json.tmp` is ignored.
 
 Garbage collection should be automatic from the library user's perspective. The
 engine should opportunistically check whether GC is worthwhile after segment
@@ -344,8 +359,8 @@ The storage format needs explicit recovery rules for:
 - stale `manifest` or `manifest.tmp` after segment creation
 - segment rotation
 - snapshot checkpoint record append
-- `gc.json` update after checkpoint append
+- `checkpoints.json` update after checkpoint append
 - old segment deletion
 - stale `nodes.json.tmp` after registry update
-- stale `gc.json.tmp` after checkpoint update
+- stale `checkpoints.json.tmp` after checkpoint update
 - process crash after fsyncing records before updating metadata files

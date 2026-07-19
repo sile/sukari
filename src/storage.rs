@@ -6,6 +6,7 @@ use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_rem
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
+    fmt,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -20,6 +21,9 @@ const SEGMENT_ID_WIDTH: usize = 6;
 const MANIFEST_FILE_NAME: &str = "manifest";
 const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
 const MANIFEST_VERSION: u64 = 1;
+const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
+const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
+const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
@@ -52,6 +56,7 @@ pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
     registry: NodeRegistry,
+    checkpoint_index: CheckpointIndex,
     writer: SegmentWriter,
 }
 
@@ -79,11 +84,13 @@ impl StorageEngine {
         let active_segment = select_active_append_segment(&dir)?;
         recover_storage_dir(&dir, active_segment)?;
         let registry = NodeRegistry::load(&dir)?;
+        let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
         let writer = SegmentWriter::open(&dir, sync, active_segment, max_segment_len)?;
         Ok(Self {
             dir,
             sync,
             registry,
+            checkpoint_index,
             writer,
         })
     }
@@ -119,7 +126,12 @@ impl StorageEngine {
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
         self.ensure_node_exists(node_id)?;
-        replay_node_state(&self.dir, self.writer.active_segment, node_id)
+        replay_node_state(
+            &self.dir,
+            self.writer.active_segment,
+            node_id,
+            self.checkpoint_index.checkpoint_position(node_id),
+        )
     }
 
     /// Loads the latest state of all non-removed nodes.
@@ -171,8 +183,18 @@ impl StorageEngine {
     ) -> io::Result<()> {
         self.ensure_node_exists(node_id)?;
         checkpoint.validate()?;
-        self.writer
-            .append(node_id, &Record::SnapshotCheckpoint(checkpoint))
+        let checkpoint_position = self
+            .writer
+            .append(node_id, &Record::SnapshotCheckpoint(checkpoint))?;
+        if should_sync_metadata(self.sync) {
+            self.writer.flush()?;
+        }
+
+        let mut checkpoint_index = self.checkpoint_index.clone();
+        checkpoint_index.set_checkpoint_position(node_id, checkpoint_position);
+        checkpoint_index.save(&self.dir, self.sync)?;
+        self.checkpoint_index = checkpoint_index;
+        Ok(())
     }
 
     /// Marks the given Raft node as removed and reserves its node ID.
@@ -181,6 +203,11 @@ impl StorageEngine {
         registry.remove_node(node_id)?;
         registry.save(&self.dir, self.sync)?;
         self.registry = registry;
+
+        let mut checkpoint_index = self.checkpoint_index.clone();
+        checkpoint_index.remove_node(node_id);
+        checkpoint_index.save(&self.dir, self.sync)?;
+        self.checkpoint_index = checkpoint_index;
         Ok(())
     }
 
@@ -207,7 +234,7 @@ impl StorageEngine {
 
     fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
         self.ensure_node_exists(node_id)?;
-        self.writer.append(node_id, &record)
+        self.writer.append(node_id, &record).map(|_| ())
     }
 
     fn ensure_node_exists(&self, node_id: noraft::NodeId) -> io::Result<()> {
@@ -261,7 +288,7 @@ impl SegmentWriter {
         })
     }
 
-    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<()> {
+    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<RecordPosition> {
         debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
@@ -269,12 +296,17 @@ impl SegmentWriter {
         if self.should_rotate(written_bytes) {
             self.rotate()?;
         }
+        let record_position = RecordPosition {
+            segment: self.active_segment,
+            offset: self.segment_len,
+        };
         self.file.write_all(&frame)?;
         self.segment_len = self
             .segment_len
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
-        self.after_write(written_bytes)
+        self.after_write(written_bytes)?;
+        Ok(record_position)
     }
 
     fn should_rotate(&self, written_bytes: u64) -> bool {
@@ -803,6 +835,206 @@ fn format_manifest(manifest: Manifest) -> String {
     text
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CheckpointIndex {
+    nodes: BTreeMap<noraft::NodeId, CheckpointNodeIndex>,
+}
+
+impl CheckpointIndex {
+    fn load(dir: &Path, registry: &NodeRegistry) -> io::Result<Self> {
+        let path = dir.join(CHECKPOINT_INDEX_FILE_NAME);
+        let mut text = String::new();
+        match File::open(&path) {
+            Ok(mut file) => {
+                file.read_to_string(&mut text)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        }
+
+        let json = nojson::RawJsonOwned::parse(text).map_err(invalid_json)?;
+        let mut index = parse_checkpoint_index(json.value()).map_err(invalid_json)?;
+        index
+            .nodes
+            .retain(|node_id, _| registry.is_active(*node_id));
+        index.validate_checkpoint_positions(dir)?;
+        Ok(index)
+    }
+
+    fn save(&self, dir: &Path, sync: SyncPolicy) -> io::Result<()> {
+        let path = dir.join(CHECKPOINT_INDEX_FILE_NAME);
+        let tmp_path = dir.join(CHECKPOINT_INDEX_TMP_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(format_checkpoint_index(self).as_bytes())?;
+        if should_sync_metadata(sync) {
+            file.sync_all()?;
+        }
+        drop(file);
+
+        std::fs::rename(&tmp_path, &path)?;
+        if should_sync_metadata(sync) {
+            sync_dir(dir)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_position(&self, node_id: noraft::NodeId) -> Option<RecordPosition> {
+        self.nodes
+            .get(&node_id)
+            .map(|state| state.checkpoint_position)
+    }
+
+    fn set_checkpoint_position(&mut self, node_id: noraft::NodeId, position: RecordPosition) {
+        debug_assert_eq!(position.segment.kind, SegmentKind::Append);
+        self.nodes.insert(
+            node_id,
+            CheckpointNodeIndex {
+                checkpoint_position: position,
+            },
+        );
+    }
+
+    fn remove_node(&mut self, node_id: noraft::NodeId) {
+        self.nodes.remove(&node_id);
+    }
+
+    fn validate_checkpoint_positions(&self, dir: &Path) -> io::Result<()> {
+        for (node_id, state) in &self.nodes {
+            validate_checkpoint_position(dir, *node_id, state.checkpoint_position)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointNodeIndex {
+    checkpoint_position: RecordPosition,
+}
+
+fn parse_checkpoint_index(
+    value: nojson::RawJsonValue<'_, '_>,
+) -> Result<CheckpointIndex, nojson::JsonParseError> {
+    let version_value = value.to_member("version")?.required()?;
+    let version: u64 = version_value.try_into()?;
+    if version != CHECKPOINT_INDEX_VERSION {
+        return Err(version_value.invalid("unsupported checkpoint index version"));
+    }
+
+    let nodes_value = value.to_member("nodes")?.required()?;
+    let mut index = CheckpointIndex::default();
+    for (key, value) in nodes_value.to_object()? {
+        let key_text = key.to_unquoted_string_str()?;
+        let node_id = key_text
+            .parse()
+            .map(noraft::NodeId::new)
+            .map_err(|e| key.invalid(e))?;
+        let node_index = parse_checkpoint_node_index(value)?;
+        if index.nodes.insert(node_id, node_index).is_some() {
+            return Err(key.invalid("duplicate node ID"));
+        }
+    }
+    Ok(index)
+}
+
+fn parse_checkpoint_node_index(
+    value: nojson::RawJsonValue<'_, '_>,
+) -> Result<CheckpointNodeIndex, nojson::JsonParseError> {
+    let segment_value = value.to_member("checkpoint_segment")?.required()?;
+    let segment_name: String = segment_value.try_into()?;
+    let checkpoint_segment = SegmentName::parse_str(&segment_name)
+        .ok_or_else(|| segment_value.invalid("invalid checkpoint segment name"))?;
+    if checkpoint_segment.kind != SegmentKind::Append {
+        return Err(segment_value.invalid("checkpoint segment must be an append segment"));
+    }
+
+    let offset_value = value.to_member("checkpoint_offset")?.required()?;
+    let checkpoint_offset = offset_value.try_into()?;
+
+    Ok(CheckpointNodeIndex {
+        checkpoint_position: RecordPosition {
+            segment: checkpoint_segment,
+            offset: checkpoint_offset,
+        },
+    })
+}
+
+fn format_checkpoint_index(index: &CheckpointIndex) -> String {
+    let mut text = nojson::json(|f| {
+        f.set_indent_size(2);
+        f.set_spacing(true);
+        f.object(|f| {
+            f.member("version", CHECKPOINT_INDEX_VERSION)?;
+            f.member("nodes", CheckpointIndexNodesJson(index))
+        })
+    })
+    .to_string();
+    text.push('\n');
+    text
+}
+
+struct CheckpointIndexNodesJson<'a>(&'a CheckpointIndex);
+
+impl nojson::DisplayJson for CheckpointIndexNodesJson<'_> {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            for (node_id, state) in &self.0.nodes {
+                f.member(node_id.get(), CheckpointNodeIndexJson(state))?;
+            }
+            Ok(())
+        })
+    }
+}
+
+struct CheckpointNodeIndexJson<'a>(&'a CheckpointNodeIndex);
+
+impl nojson::DisplayJson for CheckpointNodeIndexJson<'_> {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            f.member(
+                "checkpoint_segment",
+                self.0.checkpoint_position.segment.file_name(),
+            )?;
+            f.member("checkpoint_offset", self.0.checkpoint_position.offset)
+        })
+    }
+}
+
+fn validate_checkpoint_position(
+    dir: &Path,
+    node_id: noraft::NodeId,
+    position: RecordPosition,
+) -> io::Result<()> {
+    if !segment_file_exists(dir, position.segment)? {
+        return Err(invalid_data("checkpoint index segment does not exist"));
+    }
+
+    let segment_path = position.segment.path(dir);
+    let mut file = OpenOptions::new().read(true).open(&segment_path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < position.offset {
+        return Err(invalid_data(
+            "checkpoint index offset exceeds segment length",
+        ));
+    }
+    file.seek(SeekFrom::Start(position.offset))?;
+    let body = read_record_body(&mut file)?
+        .ok_or_else(|| invalid_data("checkpoint index offset does not point to a record"))?;
+    let node_record = decode_node_record(&body)?;
+    if node_record.node_id != node_id {
+        return Err(invalid_data("checkpoint index node ID mismatch"));
+    }
+    if !matches!(node_record.record, Record::SnapshotCheckpoint(_)) {
+        return Err(invalid_data(
+            "checkpoint index does not point to a checkpoint",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ReplayState {
     nodes: BTreeMap<noraft::NodeId, StorageState>,
@@ -838,14 +1070,19 @@ fn replay_node_state(
     dir: &Path,
     active_segment: SegmentName,
     node_id: noraft::NodeId,
+    checkpoint_hint: Option<RecordPosition>,
 ) -> io::Result<StorageState> {
     let mut target_nodes = BTreeSet::new();
     target_nodes.insert(node_id);
-    let checkpoint_positions = find_checkpoint_positions(dir, active_segment, Some(&target_nodes))?;
+    let checkpoint_positions =
+        find_checkpoint_positions_from(dir, active_segment, Some(&target_nodes), checkpoint_hint)?;
     let checkpoint_position = checkpoint_positions.get(&node_id).copied();
 
     let mut state = StorageState::default();
     for segment in discover_segment_paths(dir)? {
+        if checkpoint_position.is_some_and(|checkpoint| segment.name < checkpoint.segment) {
+            continue;
+        }
         let allow_partial = segment.name == active_segment;
         replay_node_segment(
             &segment,
@@ -916,10 +1153,31 @@ fn find_checkpoint_positions(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
+    find_checkpoint_positions_from(dir, active_segment, node_filter, None)
+}
+
+fn find_checkpoint_positions_from(
+    dir: &Path,
+    active_segment: SegmentName,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    start_position: Option<RecordPosition>,
+) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
     let mut checkpoints = BTreeMap::new();
     for segment in discover_segment_paths(dir)? {
+        if start_position.is_some_and(|start| segment.name < start.segment) {
+            continue;
+        }
         let allow_partial = segment.name == active_segment;
-        scan_checkpoint_positions(&segment, allow_partial, node_filter, &mut checkpoints)?;
+        let start_offset = start_position
+            .filter(|start| segment.name == start.segment)
+            .map(|start| start.offset);
+        scan_checkpoint_positions(
+            &segment,
+            allow_partial,
+            node_filter,
+            start_offset,
+            &mut checkpoints,
+        )?;
     }
     Ok(checkpoints)
 }
@@ -928,14 +1186,21 @@ fn scan_checkpoint_positions(
     segment: &SegmentPath,
     allow_partial: bool,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    start_offset: Option<u64>,
     checkpoints: &mut BTreeMap<noraft::NodeId, RecordPosition>,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
         .open(&segment.path)?;
-    file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
+    let start_offset = start_offset.unwrap_or(0);
+    if file_len < start_offset {
+        return Err(invalid_data(
+            "checkpoint scan offset exceeds segment length",
+        ));
+    }
+    file.seek(SeekFrom::Start(start_offset))?;
 
     loop {
         let record_start = file.stream_position()?;
@@ -1636,6 +1901,10 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn invalid_json(error: nojson::JsonParseError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn remove_storage_dir_if_exists(path: &Path, sync: SyncPolicy) -> io::Result<()> {
