@@ -23,10 +23,7 @@
 
 ## Compaction And Garbage Collection
 
-- Implement automatic whole-segment garbage collection using
-  `checkpoints.json` barriers.
 - Define `GcPolicy` thresholds for opportunistic deletion.
-- Define old segment deletion and directory sync ordering.
 
 ## Testing
 

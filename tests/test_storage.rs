@@ -14,6 +14,8 @@ use std::{
 const SEGMENT_FILE_NAME: &str = "append-000001.segment";
 const SECOND_SEGMENT_FILE_NAME: &str = "append-000002.segment";
 const THIRD_SEGMENT_FILE_NAME: &str = "append-000003.segment";
+const FOURTH_SEGMENT_FILE_NAME: &str = "append-000004.segment";
+const FIFTH_SEGMENT_FILE_NAME: &str = "append-000005.segment";
 const MANIFEST_FILE_NAME: &str = "manifest";
 const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
 const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
@@ -99,12 +101,16 @@ fn storage_engine_persists_node_registry_metadata() {
             .expect("worker metadata should persist"),
         &worker_metadata
     );
+    let state = engine
+        .load(noraft::NodeId::new(1))
+        .expect("empty created node should load");
+    assert_eq!(state.current_term, noraft::Term::ZERO);
     assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("empty created node should load")
-            .current_term,
-        noraft::Term::ZERO
+        state
+            .snapshot
+            .expect("initial checkpoint snapshot should load")
+            .last_included,
+        noraft::LogPosition::ZERO
     );
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
@@ -268,8 +274,11 @@ fn storage_engine_persists_checkpoint_index_positions() {
     let checkpoint_index = read_checkpoint_index(&dir);
     assert!(checkpoint_index.contains(r#""version": 1"#));
     assert!(checkpoint_index.contains(r#""1": {"#));
-    assert!(checkpoint_index.contains(r#""checkpoint_segment": "append-000002.segment""#));
+    assert!(checkpoint_index.contains(r#""checkpoint_segment": "append-000003.segment""#));
     assert!(checkpoint_index.contains(r#""checkpoint_offset": 0"#));
+    assert!(!segment_path(&dir).exists());
+    assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     drop(engine);
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
@@ -359,8 +368,8 @@ fn storage_engine_rejects_invalid_checkpoint_index_files() {
 #[test]
 fn storage_engine_rejects_checkpoint_index_that_points_to_non_checkpoint_record() {
     let dir = unique_temp_dir("sukari-storage-checkpoint-index-non-checkpoint");
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
     create_node(&mut engine, 1);
     engine
         .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
@@ -369,7 +378,7 @@ fn storage_engine_rejects_checkpoint_index_that_points_to_non_checkpoint_record(
 
     write_checkpoint_index(
         &dir,
-        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000001.segment","checkpoint_offset":0}}}"#,
+        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000002.segment","checkpoint_offset":0}}}"#,
     );
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
@@ -483,6 +492,136 @@ fn storage_engine_removes_removed_nodes_from_checkpoint_index() {
 
     let checkpoint_index = read_checkpoint_index(&dir);
     assert!(checkpoint_index.contains(r#""nodes": {}"#));
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_collects_obsolete_segments_after_checkpoint() {
+    let dir = unique_temp_dir("sukari-storage-gc-checkpoint");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    create_node(&mut engine, 1);
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("old term should be stored");
+    assert!(segment_path(&dir).exists());
+
+    engine
+        .save_snapshot(
+            noraft::NodeId::new(1),
+            checkpoint(
+                noraft::Term::new(2),
+                None,
+                snapshot(noraft::LogPosition::ZERO, b"checkpoint"),
+                append(noraft::LogPosition::ZERO, std::iter::empty(), []),
+            ),
+        )
+        .expect("checkpoint should be stored");
+    assert!(!segment_path(&dir).exists());
+    assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
+        .expect("new term should be stored");
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(3)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_uses_initial_checkpoint_barriers_for_gc() {
+    let dir = unique_temp_dir("sukari-storage-gc-missing-checkpoint");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    create_node(&mut engine, 1);
+    create_node(&mut engine, 2);
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("node 1 term should be stored");
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(1))
+        .expect("node 2 term should be stored");
+    engine
+        .save_snapshot(
+            noraft::NodeId::new(1),
+            checkpoint(
+                noraft::Term::new(2),
+                None,
+                snapshot(noraft::LogPosition::ZERO, b"checkpoint"),
+                append(noraft::LogPosition::ZERO, std::iter::empty(), []),
+            ),
+        )
+        .expect("node 1 checkpoint should be stored");
+
+    assert!(!segment_path(&dir).exists());
+    assert!(segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, FIFTH_SEGMENT_FILE_NAME).exists());
+
+    engine
+        .remove_node(noraft::NodeId::new(2))
+        .expect("node 2 should be removed");
+    assert!(!segment_path(&dir).exists());
+    assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(!segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+    assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, FIFTH_SEGMENT_FILE_NAME).exists());
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node 1 state should load")
+            .current_term,
+        noraft::Term::new(2)
+    );
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(2))
+            .expect_err("removed node should not load")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_collects_inactive_segments_after_last_node_removal() {
+    let dir = unique_temp_dir("sukari-storage-gc-last-node-removed");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    create_node(&mut engine, 1);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("first term should be stored");
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(2))
+        .expect("second term should be stored");
+
+    engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect("node should be removed");
+    assert!(!segment_path(&dir).exists());
+    assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -1079,7 +1218,7 @@ fn storage_engine_truncates_trailing_partial_record_in_latest_segment() {
         .expect("second term should be stored");
     drop(engine);
 
-    let path = segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME);
+    let path = segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME);
     let stable_len = std::fs::metadata(&path)
         .expect("latest segment should exist")
         .len();
@@ -1205,11 +1344,8 @@ fn create_two_segment_store(dir: &Path) {
         .expect("storage should open");
     create_node(&mut engine, 1);
     engine
-        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
-        .expect("first term should be stored");
-    engine
         .save_current_term(noraft::NodeId::new(1), noraft::Term::new(2))
-        .expect("second term should be stored");
+        .expect("term should be stored");
 }
 
 fn create_checkpoint_index_store(dir: &Path) {

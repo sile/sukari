@@ -167,6 +167,12 @@ node IDs reserved, so `create_node()` rejects an ID even after `remove_node()`
 has marked it as removed. `remove_node()` updates `nodes.json` only; it does not
 append a segment record.
 
+`create_node()` appends an initial empty checkpoint record before it makes the
+node visible in `nodes.json`. The initial checkpoint uses term zero, no vote, a
+zero-position snapshot with an empty payload, and an empty suffix. Its location
+is stored in `checkpoints.json`. This gives every normally created active node a
+checkpoint barrier without adding GC-specific fields to `nodes.json`.
+
 Each node entry should contain a typed `startup` flag and opaque JSON metadata.
 The `startup` flag means the node should be considered during process startup
 before any external control plane has been loaded. The metadata JSON is
@@ -250,6 +256,11 @@ metadata, the checkpoint record is flushed before `checkpoints.json` is
 replaced. This ordering can leave the index stale after a crash, but it should
 not point at a checkpoint record that was never made durable.
 
+`create_node()` uses the same ordering for its initial checkpoint. If a crash
+happens after the checkpoint index update but before the node registry update,
+the checkpoint index entry is ignored on the next open because the node is not
+active.
+
 ## Replay
 
 Startup discovers `append-*.segment` files, replays them in deterministic
@@ -301,12 +312,15 @@ The initial design should avoid rewrite segments. It should not copy live
 records into separate rewrite files. This keeps crash recovery and replay
 ordering simple and avoids a data-loss-prone rewrite completion protocol.
 
-Instead, the engine should use whole-segment garbage collection. Whole-segment
-GC deletes only inactive append segments that are older than every active node's
-checkpoint barrier. If any active node has no checkpoint barrier, GC must keep
-older segments because that node may still need records before its first
-snapshot checkpoint. Removed nodes do not participate in the minimum barrier
-calculation.
+Instead, the engine uses whole-segment garbage collection. Whole-segment GC
+deletes only inactive append segments that are older than every active node's
+checkpoint barrier. It never deletes the active segment or the segment that
+contains an active node's latest checkpoint. If any active node has no
+checkpoint barrier, GC keeps older segments because that node may still need
+records before its first snapshot checkpoint. Normally, `create_node()` gives
+each active node an initial checkpoint barrier. Removed nodes do not participate
+in the minimum barrier calculation. If no active nodes remain, GC may delete all
+inactive append segments.
 
 The current implementation stores latest checkpoint locations in a separate
 authoritative JSON file, `checkpoints.json`:
@@ -333,22 +347,24 @@ for future deletion and useful as a replay hint. If `checkpoints.json` is
 missing, the engine behaves as if no checkpoint barriers exist. If it exists but
 is malformed, violates the schema, names a non-append segment, points at a
 non-existent segment, or points at an offset that is not a checkpoint record for
-the target node, opening the engine fails with `InvalidData`. Entries for
-well-formed entries for removed or unknown nodes are ignored on open, and
-`remove_node()` removes the node from the checkpoint index.
+the target node, opening the engine fails with `InvalidData`. Well-formed
+entries for removed or unknown nodes are ignored on open, and `remove_node()`
+removes the node from the checkpoint index.
 
 `checkpoints.json` is updated by atomic replacement. A checkpoint update appends
 and durably syncs the checkpoint record first when the sync policy requires it.
 Then it writes `checkpoints.json.tmp`, syncs it when durable metadata is
 required, renames it over `checkpoints.json`, and syncs the parent directory
-when durable metadata is required. A stale `checkpoints.json.tmp` is ignored.
+when durable metadata is required. Node creation follows the same order before
+updating `nodes.json`. A stale `checkpoints.json.tmp` is ignored.
 
-Garbage collection should be automatic from the library user's perspective. The
-engine should opportunistically check whether GC is worthwhile after segment
-rotation, after a successful snapshot checkpoint, and after node removal. It
-should not require the caller to choose exact collection timing. A future
-`GcPolicy` can control thresholds such as the minimum number of inactive
-segments or minimum reclaimable bytes before deletion runs.
+Garbage collection is automatic from the library user's perspective. The engine
+checks for deletable segments after segment rotation, after a successful
+snapshot checkpoint, and after node removal. It does not require the caller to
+choose exact collection timing. When durable metadata is required, segment
+deletion is followed by a directory sync. A future `GcPolicy` can control
+thresholds such as the minimum number of inactive segments or minimum
+reclaimable bytes before deletion runs.
 
 ## Crash Recovery
 
@@ -358,6 +374,7 @@ The storage format needs explicit recovery rules for:
 - checksum mismatch
 - stale `manifest` or `manifest.tmp` after segment creation
 - segment rotation
+- initial checkpoint record append during node creation
 - snapshot checkpoint record append
 - `checkpoints.json` update after checkpoint append
 - old segment deletion

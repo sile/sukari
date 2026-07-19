@@ -103,8 +103,20 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let mut registry = self.registry.clone();
         registry.create_node(node_id, metadata)?;
+        let append = self
+            .writer
+            .append(node_id, &Record::SnapshotCheckpoint(initial_checkpoint()))?;
+        if should_sync_metadata(self.sync) {
+            self.writer.flush()?;
+        }
+
+        let mut checkpoint_index = self.checkpoint_index.clone();
+        checkpoint_index.set_checkpoint_position(node_id, append.position);
+        checkpoint_index.save(&self.dir, self.sync)?;
         registry.save(&self.dir, self.sync)?;
         self.registry = registry;
+        self.checkpoint_index = checkpoint_index;
+        self.collect_garbage()?;
         Ok(())
     }
 
@@ -183,7 +195,7 @@ impl StorageEngine {
     ) -> io::Result<()> {
         self.ensure_node_exists(node_id)?;
         checkpoint.validate()?;
-        let checkpoint_position = self
+        let append = self
             .writer
             .append(node_id, &Record::SnapshotCheckpoint(checkpoint))?;
         if should_sync_metadata(self.sync) {
@@ -191,9 +203,10 @@ impl StorageEngine {
         }
 
         let mut checkpoint_index = self.checkpoint_index.clone();
-        checkpoint_index.set_checkpoint_position(node_id, checkpoint_position);
+        checkpoint_index.set_checkpoint_position(node_id, append.position);
         checkpoint_index.save(&self.dir, self.sync)?;
         self.checkpoint_index = checkpoint_index;
+        self.collect_garbage()?;
         Ok(())
     }
 
@@ -208,6 +221,7 @@ impl StorageEngine {
         checkpoint_index.remove_node(node_id);
         checkpoint_index.save(&self.dir, self.sync)?;
         self.checkpoint_index = checkpoint_index;
+        self.collect_garbage()?;
         Ok(())
     }
 
@@ -234,7 +248,11 @@ impl StorageEngine {
 
     fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
         self.ensure_node_exists(node_id)?;
-        self.writer.append(node_id, &record).map(|_| ())
+        let append = self.writer.append(node_id, &record)?;
+        if append.rotated {
+            self.collect_garbage()?;
+        }
+        Ok(())
     }
 
     fn ensure_node_exists(&self, node_id: noraft::NodeId) -> io::Result<()> {
@@ -245,6 +263,37 @@ impl StorageEngine {
             return Err(node_removed_error());
         }
         Err(node_not_found_error())
+    }
+
+    fn collect_garbage(&self) -> io::Result<()> {
+        let active_node_ids = self.registry.active_node_ids();
+        let Some(barrier) = self.checkpoint_index.gc_barrier(&active_node_ids) else {
+            return Ok(());
+        };
+
+        let mut deleted = false;
+        for segment in discover_segment_paths(&self.dir)? {
+            if segment.name.kind != SegmentKind::Append {
+                continue;
+            }
+            if segment.name == self.writer.active_segment {
+                continue;
+            }
+            if !barrier.allows_delete(segment.name) {
+                continue;
+            }
+
+            match std::fs::remove_file(&segment.path) {
+                Ok(()) => deleted = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if deleted && should_sync_metadata(self.sync) {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
     }
 }
 
@@ -258,6 +307,12 @@ struct SegmentWriter {
     max_segment_len: u64,
     unsynced_records: usize,
     unsynced_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppendOutcome {
+    position: RecordPosition,
+    rotated: bool,
 }
 
 impl SegmentWriter {
@@ -288,13 +343,15 @@ impl SegmentWriter {
         })
     }
 
-    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<RecordPosition> {
+    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<AppendOutcome> {
         debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
+        let mut rotated = false;
         if self.should_rotate(written_bytes) {
             self.rotate()?;
+            rotated = true;
         }
         let record_position = RecordPosition {
             segment: self.active_segment,
@@ -306,7 +363,10 @@ impl SegmentWriter {
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
         self.after_write(written_bytes)?;
-        Ok(record_position)
+        Ok(AppendOutcome {
+            position: record_position,
+            rotated,
+        })
     }
 
     fn should_rotate(&self, written_bytes: u64) -> bool {
@@ -471,6 +531,23 @@ impl SnapshotCheckpoint {
         state.apply_snapshot(self.snapshot)?;
         state.apply_append_owned(self.suffix)?;
         Ok(state)
+    }
+}
+
+fn initial_checkpoint() -> SnapshotCheckpoint {
+    SnapshotCheckpoint {
+        current_term: noraft::Term::ZERO,
+        voted_for: None,
+        snapshot: Snapshot {
+            last_included: noraft::LogPosition::ZERO,
+            config: noraft::ClusterConfig::new(),
+            data: Bytes::default(),
+        },
+        suffix: LogAppend::new(
+            noraft::LogEntries::new(noraft::LogPosition::ZERO),
+            BTreeMap::new(),
+        )
+        .expect("bug: empty initial checkpoint suffix should be valid"),
     }
 }
 
@@ -888,6 +965,23 @@ impl CheckpointIndex {
             .map(|state| state.checkpoint_position)
     }
 
+    fn gc_barrier(&self, active_node_ids: &BTreeSet<noraft::NodeId>) -> Option<GcBarrier> {
+        let mut oldest_checkpoint_segment = None;
+        for node_id in active_node_ids {
+            let checkpoint_segment = self.checkpoint_position(*node_id)?.segment;
+            oldest_checkpoint_segment = Some(
+                oldest_checkpoint_segment
+                    .map(|oldest: SegmentName| oldest.min(checkpoint_segment))
+                    .unwrap_or(checkpoint_segment),
+            );
+        }
+
+        match oldest_checkpoint_segment {
+            Some(segment) => Some(GcBarrier::Before(segment)),
+            None => Some(GcBarrier::AllInactiveAppendSegments),
+        }
+    }
+
     fn set_checkpoint_position(&mut self, node_id: noraft::NodeId, position: RecordPosition) {
         debug_assert_eq!(position.segment.kind, SegmentKind::Append);
         self.nodes.insert(
@@ -913,6 +1007,21 @@ impl CheckpointIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CheckpointNodeIndex {
     checkpoint_position: RecordPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcBarrier {
+    AllInactiveAppendSegments,
+    Before(SegmentName),
+}
+
+impl GcBarrier {
+    fn allows_delete(self, segment: SegmentName) -> bool {
+        match self {
+            Self::AllInactiveAppendSegments => true,
+            Self::Before(checkpoint_segment) => segment < checkpoint_segment,
+        }
+    }
 }
 
 fn parse_checkpoint_index(
