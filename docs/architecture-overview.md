@@ -55,9 +55,9 @@ storage/
   append-1.segment
 ```
 
-Segment file names are parsed into internal segment names with a segment kind
-and canonical decimal segment ID. Append segment IDs start at `0` and are
-written without zero padding. Startup reads an advisory manifest when it is
+Segment file names are parsed into internal append segment names with canonical
+decimal segment IDs. Append segment IDs start at `0` and are written without
+zero padding. Startup reads an advisory manifest when it is
 available, validates the hinted active append segment against existing segment
 files, and follows any subsequent contiguous append segment files before opening
 the writer. Startup falls back to a file-name scan when the manifest is missing,

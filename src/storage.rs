@@ -371,9 +371,6 @@ impl StorageEngine {
 
         let mut deleted_segments = 0;
         for segment in discover_segment_paths(&self.dir)? {
-            if segment.name.kind != SegmentKind::Append {
-                continue;
-            }
             if segment.name == self.writer.active_segment {
                 continue;
             }
@@ -444,7 +441,6 @@ impl SegmentWriter {
         record: &Record,
         stats: &mut StorageStatsCounters,
     ) -> io::Result<RecordPosition> {
-        debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
@@ -854,55 +850,28 @@ impl SegmentId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SegmentKind {
-    Append,
-    Rewrite,
-}
-
-impl SegmentKind {
-    fn prefix(self) -> &'static str {
-        match self {
-            Self::Append => "append",
-            Self::Rewrite => "rewrite",
-        }
-    }
-
-    fn parse_prefix(prefix: &str) -> Option<Self> {
-        match prefix {
-            "append" => Some(Self::Append),
-            "rewrite" => Some(Self::Rewrite),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SegmentName {
-    kind: SegmentKind,
     id: SegmentId,
 }
 
 impl SegmentName {
     fn first_append() -> Self {
         Self {
-            kind: SegmentKind::Append,
             id: SegmentId::FIRST,
         }
     }
 
     fn next_append(self) -> io::Result<Self> {
-        debug_assert_eq!(self.kind, SegmentKind::Append);
         Ok(Self {
-            kind: SegmentKind::Append,
             id: self.id.next()?,
         })
     }
 
     fn parse_file_name(file_name: &OsStr) -> Option<Self> {
         let file_name = file_name.to_str()?;
-        let name = file_name.strip_suffix(SEGMENT_FILE_SUFFIX)?;
-        let (prefix, id) = name.split_once('-')?;
-        let kind = SegmentKind::parse_prefix(prefix)?;
+        let id = file_name
+            .strip_prefix("append-")?
+            .strip_suffix(SEGMENT_FILE_SUFFIX)?;
         if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
@@ -910,7 +879,7 @@ impl SegmentName {
             return None;
         }
         let id = SegmentId(id.parse().ok()?);
-        Some(Self { kind, id })
+        Some(Self { id })
     }
 
     fn parse_str(s: &str) -> Option<Self> {
@@ -922,12 +891,7 @@ impl SegmentName {
     }
 
     fn file_name(self) -> String {
-        format!(
-            "{}-{}{}",
-            self.kind.prefix(),
-            self.id.get(),
-            SEGMENT_FILE_SUFFIX
-        )
+        format!("append-{}{}", self.id.get(), SEGMENT_FILE_SUFFIX)
     }
 }
 
@@ -966,7 +930,6 @@ fn select_active_append_segment_by_scan(dir: &Path) -> io::Result<SegmentName> {
     Ok(discover_segment_paths(dir)?
         .into_iter()
         .map(|segment| segment.name)
-        .filter(|segment| segment.kind == SegmentKind::Append)
         .max()
         .unwrap_or_else(SegmentName::first_append))
 }
@@ -998,7 +961,6 @@ struct Manifest {
 
 impl Manifest {
     fn active_append(active_append_segment: SegmentName) -> Self {
-        debug_assert_eq!(active_append_segment.kind, SegmentKind::Append);
         Self {
             active_append_segment,
         }
@@ -1054,9 +1016,6 @@ fn parse_manifest(value: nojson::RawJsonValue<'_, '_>) -> Result<Manifest, nojso
     let active_segment_name: String = active_segment_value.try_into()?;
     let active_append_segment = SegmentName::parse_str(&active_segment_name)
         .ok_or_else(|| active_segment_value.invalid("invalid active append segment name"))?;
-    if active_append_segment.kind != SegmentKind::Append {
-        return Err(active_segment_value.invalid("active segment must be an append segment"));
-    }
 
     Ok(Manifest::active_append(active_append_segment))
 }
@@ -1160,7 +1119,6 @@ impl CheckpointIndex {
     }
 
     fn set_checkpoint_position(&mut self, node_id: noraft::NodeId, position: RecordPosition) {
-        debug_assert_eq!(position.segment.kind, SegmentKind::Append);
         self.nodes.insert(
             node_id,
             CheckpointNodeIndex {
@@ -1237,9 +1195,6 @@ fn parse_checkpoint_node_index(
     let segment_name: String = segment_value.try_into()?;
     let checkpoint_segment = SegmentName::parse_str(&segment_name)
         .ok_or_else(|| segment_value.invalid("invalid checkpoint segment name"))?;
-    if checkpoint_segment.kind != SegmentKind::Append {
-        return Err(segment_value.invalid("checkpoint segment must be an append segment"));
-    }
 
     let offset_value = value.to_member("checkpoint_offset")?.required()?;
     let checkpoint_offset = offset_value.try_into()?;
