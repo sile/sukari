@@ -9,6 +9,8 @@ use std::{
 };
 
 const SEGMENT_FILE_NAME: &str = "append-000001.segment";
+const SECOND_SEGMENT_FILE_NAME: &str = "append-000002.segment";
+const THIRD_SEGMENT_FILE_NAME: &str = "append-000003.segment";
 const SEGMENT_HEADER_LEN: u64 = 12;
 
 #[test]
@@ -123,6 +125,52 @@ fn storage_engine_replays_records_for_multiple_nodes() {
         .load(noraft::NodeId::new(2))
         .expect("node 2 state should load");
     assert_eq!(state2.current_term, noraft::Term::new(7));
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rotates_and_replays_append_segments() {
+    let dir = unique_temp_dir("sukari-storage-rotate");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("first term should be stored");
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(2))
+        .expect("second term should be stored");
+    drop(engine);
+
+    assert!(segment_path(&dir).exists());
+    assert!(segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(2)
+    );
+
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
+        .expect("third term should be stored");
+    drop(engine);
+
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(3)
+    );
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -270,6 +318,49 @@ fn storage_engine_truncates_trailing_partial_record() {
 }
 
 #[test]
+fn storage_engine_truncates_trailing_partial_record_in_latest_segment() {
+    let dir = unique_temp_dir("sukari-storage-latest-partial");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(6))
+        .expect("first term should be stored");
+    engine
+        .save_current_term(noraft::NodeId::new(2), noraft::Term::new(7))
+        .expect("second term should be stored");
+    drop(engine);
+
+    let path = segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME);
+    let stable_len = std::fs::metadata(&path)
+        .expect("latest segment should exist")
+        .len();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("latest segment should open");
+    file.write_all(b"SKR1")
+        .expect("partial record should be written");
+    drop(file);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(2))
+            .expect("node state should load")
+            .current_term,
+        noraft::Term::new(7)
+    );
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("latest segment should still exist")
+            .len(),
+        stable_len
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_rejects_corrupted_checksum() {
     let dir = unique_temp_dir("sukari-storage-corrupt");
     let mut engine =
@@ -342,7 +433,11 @@ fn position(term: u64, index: u64) -> noraft::LogPosition {
 }
 
 fn segment_path(dir: &Path) -> PathBuf {
-    dir.join(SEGMENT_FILE_NAME)
+    segment_path_named(dir, SEGMENT_FILE_NAME)
+}
+
+fn segment_path_named(dir: &Path, file_name: &str) -> PathBuf {
+    dir.join(file_name)
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

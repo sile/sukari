@@ -16,6 +16,7 @@ const SEGMENT_CHECKSUM_LEN: usize = 4;
 const SEGMENT_HEADER_LEN: usize = SEGMENT_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
 const SEGMENT_FILE_SUFFIX: &str = ".segment";
 const SEGMENT_ID_WIDTH: usize = 6;
+const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
 
@@ -52,17 +53,33 @@ pub struct StorageEngine {
 impl StorageEngine {
     /// Makes a new shared storage engine.
     pub fn new<P: AsRef<Path>>(dir: P, sync: SyncPolicy) -> io::Result<Self> {
+        Self::with_max_segment_len(dir, sync, DEFAULT_MAX_SEGMENT_LEN)
+    }
+
+    /// Makes a new shared storage engine with a maximum append segment length.
+    ///
+    /// If a single record is larger than `max_segment_len`, it is written to an
+    /// empty segment and that segment is allowed to exceed the limit.
+    pub fn with_max_segment_len<P: AsRef<Path>>(
+        dir: P,
+        sync: SyncPolicy,
+        max_segment_len: u64,
+    ) -> io::Result<Self> {
+        if max_segment_len == 0 {
+            return Err(invalid_input("max segment length must be non-zero"));
+        }
+
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir, sync)?;
-        let active_segment = SegmentName::first_append();
+        let active_segment = select_active_append_segment(&dir)?;
         recover_storage_dir(&dir, active_segment)?;
-        let writer = SegmentWriter::open(&dir, sync, active_segment)?;
+        let writer = SegmentWriter::open(&dir, sync, active_segment, max_segment_len)?;
         Ok(Self { dir, sync, writer })
     }
 
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
-        let mut replay = replay_storage_dir(&self.dir, SegmentName::first_append())?;
+        let mut replay = replay_storage_dir(&self.dir, self.writer.active_segment)?;
         if replay.removed_nodes.contains(&node_id) {
             return Err(node_removed_error());
         }
@@ -71,7 +88,7 @@ impl StorageEngine {
 
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
-        let replay = replay_storage_dir(&self.dir, SegmentName::first_append())?;
+        let replay = replay_storage_dir(&self.dir, self.writer.active_segment)?;
         Ok(replay.nodes)
     }
 
@@ -136,27 +153,38 @@ impl StorageEngine {
 
 #[derive(Debug)]
 struct SegmentWriter {
+    dir: PathBuf,
     active_segment: SegmentName,
     file: File,
     sync: SyncPolicy,
+    segment_len: u64,
+    max_segment_len: u64,
     unsynced_records: usize,
     unsynced_bytes: u64,
 }
 
 impl SegmentWriter {
-    fn open(dir: &Path, sync: SyncPolicy, active_segment: SegmentName) -> io::Result<Self> {
+    fn open(
+        dir: &Path,
+        sync: SyncPolicy,
+        active_segment: SegmentName,
+        max_segment_len: u64,
+    ) -> io::Result<Self> {
         let segment_path = active_segment.path(dir);
         let file_existed = segment_path.exists();
         let mut file = open_active_segment_file(&segment_path)?;
         if !file_existed && should_sync_metadata(sync) {
             sync_parent_dir(&segment_path)?;
         }
-        file.seek(SeekFrom::End(0))?;
+        let segment_len = file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
+            dir: dir.to_path_buf(),
             active_segment,
             file,
             sync,
+            segment_len,
+            max_segment_len,
             unsynced_records: 0,
             unsynced_bytes: 0,
         })
@@ -167,8 +195,41 @@ impl SegmentWriter {
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
+        if self.should_rotate(written_bytes) {
+            self.rotate()?;
+        }
         self.file.write_all(&frame)?;
+        self.segment_len = self
+            .segment_len
+            .checked_add(written_bytes)
+            .ok_or_else(|| invalid_data("segment length overflow"))?;
         self.after_write(written_bytes)
+    }
+
+    fn should_rotate(&self, written_bytes: u64) -> bool {
+        if self.segment_len == 0 {
+            return false;
+        }
+        self.segment_len
+            .checked_add(written_bytes)
+            .is_none_or(|len| self.max_segment_len < len)
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        self.flush()?;
+        let next_segment = self.active_segment.next_append()?;
+        let segment_path = next_segment.path(&self.dir);
+        let file = create_active_segment_file(&segment_path)?;
+        if should_sync_metadata(self.sync) {
+            sync_parent_dir(&segment_path)?;
+        }
+
+        self.active_segment = next_segment;
+        self.file = file;
+        self.segment_len = 0;
+        self.unsynced_records = 0;
+        self.unsynced_bytes = 0;
+        Ok(())
     }
 
     fn after_write(&mut self, written_bytes: u64) -> io::Result<()> {
@@ -398,6 +459,14 @@ impl SegmentId {
     fn get(self) -> u64 {
         self.0
     }
+
+    fn next(self) -> io::Result<Self> {
+        let id = self
+            .0
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("segment ID overflow"))?;
+        Self::new(id).ok_or_else(|| invalid_data("segment ID overflow"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -437,6 +506,14 @@ impl SegmentName {
         }
     }
 
+    fn next_append(self) -> io::Result<Self> {
+        debug_assert_eq!(self.kind, SegmentKind::Append);
+        Ok(Self {
+            kind: SegmentKind::Append,
+            id: self.id.next()?,
+        })
+    }
+
     fn parse_file_name(file_name: &OsStr) -> Option<Self> {
         let file_name = file_name.to_str()?;
         let name = file_name.strip_suffix(SEGMENT_FILE_SUFFIX)?;
@@ -462,6 +539,16 @@ impl SegmentName {
             width = SEGMENT_ID_WIDTH
         )
     }
+}
+
+fn select_active_append_segment(dir: &Path) -> io::Result<SegmentName> {
+    let active_segment = discover_segment_paths(dir)?
+        .into_iter()
+        .map(|segment| segment.name)
+        .filter(|segment| segment.kind == SegmentKind::Append)
+        .max()
+        .unwrap_or_else(SegmentName::first_append);
+    Ok(active_segment)
 }
 
 #[derive(Debug)]
@@ -558,10 +645,14 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
         .write(allow_partial)
         .open(path)?;
     file.seek(SeekFrom::Start(0))?;
+    let file_len = file.metadata()?.len();
 
     loop {
         let record_start = file.stream_position()?;
         let Some(record) = read_record(&mut file)? else {
+            if record_start == file_len {
+                break;
+            }
             if allow_partial {
                 file.set_len(record_start)?;
                 file.seek(SeekFrom::Start(record_start))?;
@@ -581,6 +672,7 @@ fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
         .write(allow_partial)
         .open(path)?;
     file.seek(SeekFrom::Start(0))?;
+    let file_len = file.metadata()?.len();
 
     loop {
         let record_start = file.stream_position()?;
@@ -588,6 +680,9 @@ fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
             continue;
         }
 
+        if record_start == file_len {
+            break;
+        }
         if allow_partial {
             file.set_len(record_start)?;
             file.seek(SeekFrom::Start(record_start))?;
@@ -653,6 +748,14 @@ fn scan_record_frame(file: &mut File) -> io::Result<Option<()>> {
 fn open_active_segment_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+}
+
+fn create_active_segment_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create_new(true)
         .read(true)
         .append(true)
         .open(path)

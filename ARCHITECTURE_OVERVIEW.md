@@ -41,18 +41,20 @@ should stay in the control plane above the storage layer.
 
 ## Current Baseline
 
-The current implementation provides a conservative append-only baseline with one
-active shared segment:
+The current implementation provides a conservative append-only baseline with
+one active shared append segment at a time:
 
 ```text
 storage/
   append-000001.segment
+  append-000002.segment
 ```
 
 Segment file names are parsed into internal segment names with a segment kind
-and non-zero numeric segment ID. The active segment is still fixed to
-`append-000001.segment`; later rotation work should change active segment
-selection without changing record replay logic.
+and non-zero numeric segment ID. Startup selects the highest-numbered append
+segment as the active segment. New writes rotate to the next append segment when
+the configured segment length would be exceeded. A single record that exceeds
+the limit is written to an empty segment by itself.
 
 The public API exposes node ID based storage operations on a single engine
 writer:

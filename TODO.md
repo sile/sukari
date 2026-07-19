@@ -16,7 +16,7 @@
 ## Segment Format
 
 - Document the `SKR1` format once the first release boundary is clear.
-- Add segment rotation policy and manifest-backed active segment selection.
+- Add manifest-backed active segment selection.
 - Define manifest format and whether it is authoritative or advisory.
 - Define rewrite segment ordering and completion records.
 
