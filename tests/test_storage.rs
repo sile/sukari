@@ -475,6 +475,47 @@ fn storage_engine_scans_after_stale_checkpoint_index_hint() {
             .as_slice(),
         b"new-checkpoint"
     );
+    let all = engine
+        .load_all()
+        .expect("newer checkpoint should be found for load_all after the stale hint");
+    let state = all
+        .get(&noraft::NodeId::new(1))
+        .expect("node state should be loaded");
+    assert_eq!(state.current_term, noraft::Term::new(2));
+    assert_eq!(
+        state
+            .snapshot
+            .as_ref()
+            .expect("new checkpoint should be loaded")
+            .data
+            .as_slice(),
+        b"new-checkpoint"
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_load_all_falls_back_without_checkpoint_index() {
+    let dir = unique_temp_dir("sukari-storage-load-all-no-checkpoint-index");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(5))
+        .expect("term should be stored");
+    drop(engine);
+    std::fs::remove_file(dir.join(CHECKPOINT_INDEX_FILE_NAME))
+        .expect("checkpoint index should be removed");
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let all = engine.load_all().expect("states should load by full scan");
+    assert_eq!(
+        all.get(&noraft::NodeId::new(1))
+            .expect("node state should be loaded")
+            .current_term,
+        noraft::Term::new(5)
+    );
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }

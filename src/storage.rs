@@ -149,10 +149,16 @@ impl StorageEngine {
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
         let active_node_ids = self.registry.active_node_ids();
+        if active_node_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let checkpoint_hints = self.checkpoint_index.checkpoint_positions(&active_node_ids);
         let mut replay = replay_storage_dir(
             &self.dir,
             self.writer.active_segment,
             Some(&active_node_ids),
+            checkpoint_hints,
         )?;
         let mut nodes = BTreeMap::new();
         for node_id in active_node_ids {
@@ -965,6 +971,17 @@ impl CheckpointIndex {
             .map(|state| state.checkpoint_position)
     }
 
+    fn checkpoint_positions(
+        &self,
+        node_ids: &BTreeSet<noraft::NodeId>,
+    ) -> Option<BTreeMap<noraft::NodeId, RecordPosition>> {
+        let mut positions = BTreeMap::new();
+        for node_id in node_ids {
+            positions.insert(*node_id, self.checkpoint_position(*node_id)?);
+        }
+        Some(positions)
+    }
+
     fn gc_barrier(&self, active_node_ids: &BTreeSet<noraft::NodeId>) -> Option<GcBarrier> {
         let mut oldest_checkpoint_segment = None;
         for node_id in active_node_ids {
@@ -1208,10 +1225,15 @@ fn replay_storage_dir(
     dir: &Path,
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
 ) -> io::Result<ReplayState> {
-    let checkpoint_positions = find_checkpoint_positions(dir, active_segment, node_filter)?;
+    let (checkpoint_positions, replay_start_segment) =
+        checkpoint_positions_for_replay(dir, active_segment, node_filter, checkpoint_hints)?;
     let mut replay = ReplayState::default();
     for segment in discover_segment_paths(dir)? {
+        if replay_start_segment.is_some_and(|start| segment.name < start) {
+            continue;
+        }
         let allow_partial = segment.name == active_segment;
         replay_segment(
             &segment,
@@ -1222,6 +1244,29 @@ fn replay_storage_dir(
         )?;
     }
     Ok(replay)
+}
+
+fn checkpoint_positions_for_replay(
+    dir: &Path,
+    active_segment: SegmentName,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
+) -> io::Result<(
+    BTreeMap<noraft::NodeId, RecordPosition>,
+    Option<SegmentName>,
+)> {
+    let Some(mut checkpoint_positions) = checkpoint_hints else {
+        return find_checkpoint_positions(dir, active_segment, node_filter)
+            .map(|positions| (positions, None));
+    };
+
+    let Some(start_position) = checkpoint_positions.values().copied().min() else {
+        return Ok((checkpoint_positions, None));
+    };
+    let discovered =
+        find_checkpoint_positions_from(dir, active_segment, node_filter, Some(start_position))?;
+    checkpoint_positions.extend(discovered);
+    Ok((checkpoint_positions, Some(start_position.segment)))
 }
 
 fn recover_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<()> {

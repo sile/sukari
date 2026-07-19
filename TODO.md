@@ -18,8 +18,6 @@
 ## Replay
 
 - Decide whether inactive segments should ever tolerate trailing partial records.
-- Consider whether `load_all()` should use `checkpoints.json` hints instead of
-  scanning all segments for checkpoint records.
 
 ## Compaction And Garbage Collection
 

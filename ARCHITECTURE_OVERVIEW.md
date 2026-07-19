@@ -275,9 +275,13 @@ file-name order, and rebuilds per-node state:
 The first version should not require an on-disk random-read log index. Normal
 reads are expected to be rare and mostly limited to startup. `checkpoints.json`
 is only a checkpoint index: `load(node_id)` can use it as a hint to skip
-segments before the latest known checkpoint, but it is not a general random-read
-index for log paging. If the index is missing, replay falls back to scanning
-segments. If the index is stale, replay scans from the hinted checkpoint record
+segments before the latest known checkpoint, and `load_all()` can use it when
+every active node has a checkpoint hint. In that case, `load_all()` starts from
+the oldest hinted checkpoint segment and still scans forward for newer
+checkpoints. If any active node has no checkpoint hint, `load_all()` falls back
+to the full replay path because that node may need records before its first
+checkpoint. The checkpoint index is not a general random-read index for log
+paging. If the index is stale, replay scans from the hinted checkpoint record
 forward and can still discover a newer checkpoint.
 
 The active segment tolerates a trailing partial record and truncates it during
