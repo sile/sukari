@@ -49,6 +49,16 @@ fn log_append_rejects_payloads_without_command_entries() {
 }
 
 #[test]
+fn storage_engine_rejects_zero_max_segment_len() {
+    let dir = unique_temp_dir("sukari-storage-zero-segment-len");
+
+    let err = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 0)
+        .expect_err("zero max segment length should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(!dir.exists());
+}
+
+#[test]
 fn storage_engine_persists_node_registry_metadata() {
     let dir = unique_temp_dir("sukari-storage-registry");
     let mut engine =
@@ -159,6 +169,21 @@ fn storage_engine_rejects_uncreated_nodes() {
 }
 
 #[test]
+fn storage_engine_rejects_duplicate_active_node_creation() {
+    let dir = unique_temp_dir("sukari-storage-duplicate-node");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+
+    let err = engine
+        .create_node(noraft::NodeId::new(1), NodeMetadata::default())
+        .expect_err("active node ID should not be reusable");
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_reserves_removed_node_ids() {
     let dir = unique_temp_dir("sukari-storage-removed-node-id");
     let mut engine =
@@ -185,6 +210,29 @@ fn storage_engine_reserves_removed_node_ids() {
         .create_node(noraft::NodeId::new(7), NodeMetadata::default())
         .expect_err("removed node ID should remain reserved after reopen");
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rejects_unknown_and_removed_node_removal() {
+    let dir = unique_temp_dir("sukari-storage-remove-errors");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+
+    let err = engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect_err("unknown node should not be removed");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+    create_node(&mut engine, 1);
+    engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect("node should be removed");
+    let err = engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect_err("removed node should not be removed again");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }

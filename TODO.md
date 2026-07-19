@@ -17,6 +17,5 @@
 
 ## Testing
 
-- Expand focused unit tests for explicit error paths.
 - Decide whether manifest, registry, and `checkpoints.json` sync ordering need
   fault-injection tests.
