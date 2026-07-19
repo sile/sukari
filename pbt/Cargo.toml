@@ -5,9 +5,7 @@ edition = "2024"
 publish = false
 
 [dev-dependencies]
-# Storage crate under property-based testing.
 sukari = { path = "../" }
-# Core Raft types used to generate storage operations.
-noraft = { git = "https://github.com/sile/noraft", branch = "main" }
+noraft = { workspace = true }
 # Property-based testing framework.
 proptest = "1.11"

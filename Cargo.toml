@@ -10,11 +10,15 @@ readme = "README.md"
 categories = ["algorithms", "database-implementations"]
 keywords = ["raft", "storage", "wal", "multi-raft"]
 
-[dependencies]
+[workspace]
+members = ["pbt"]
+
+[workspace.dependencies]
 # Core Raft state machine and protocol types.
 noraft = { git = "https://github.com/sile/noraft", branch = "main" }
 # Node registry JSON parsing and formatting.
 nojson = "0.3"
 
-[workspace]
-members = ["pbt"]
+[dependencies]
+noraft = { workspace = true }
+nojson = { workspace = true }
