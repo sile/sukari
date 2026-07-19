@@ -160,9 +160,19 @@ impl StorageEngine {
         self.save_record(node_id, Record::Append(append))
     }
 
-    /// Saves a snapshot.
-    pub fn save_snapshot(&mut self, node_id: noraft::NodeId, snapshot: Snapshot) -> io::Result<()> {
-        self.save_record(node_id, Record::Snapshot(snapshot))
+    /// Saves a snapshot checkpoint.
+    ///
+    /// The checkpoint suffix must start at the snapshot's last included
+    /// position.
+    pub fn save_snapshot(
+        &mut self,
+        node_id: noraft::NodeId,
+        checkpoint: SnapshotCheckpoint,
+    ) -> io::Result<()> {
+        self.ensure_node_exists(node_id)?;
+        checkpoint.validate()?;
+        self.writer
+            .append(node_id, &Record::SnapshotCheckpoint(checkpoint))
     }
 
     /// Marks the given Raft node as removed and reserves its node ID.
@@ -392,6 +402,46 @@ pub struct Snapshot {
     pub data: Bytes,
 }
 
+/// Snapshot checkpoint data saved by the storage backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCheckpoint {
+    /// Current term at the checkpoint.
+    pub current_term: noraft::Term,
+
+    /// Node voted for in the current term at the checkpoint.
+    pub voted_for: Option<noraft::NodeId>,
+
+    /// Latest snapshot at the checkpoint.
+    pub snapshot: Snapshot,
+
+    /// Log suffix retained after the snapshot.
+    ///
+    /// The suffix must start at `snapshot.last_included`.
+    pub suffix: LogAppend,
+}
+
+impl SnapshotCheckpoint {
+    fn validate(&self) -> io::Result<()> {
+        self.suffix.validate()?;
+        if self.suffix.entries.prev_position() != self.snapshot.last_included {
+            return Err(invalid_input(
+                "checkpoint suffix must start at the snapshot position",
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_state(self) -> io::Result<StorageState> {
+        self.validate()?;
+        let mut state = StorageState::default();
+        state.apply_current_term(self.current_term);
+        state.apply_voted_for(self.voted_for);
+        state.apply_snapshot(self.snapshot)?;
+        state.apply_append_owned(self.suffix)?;
+        Ok(state)
+    }
+}
+
 /// Loaded persistent state for a Raft node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageState {
@@ -466,7 +516,7 @@ impl StorageState {
         Ok(())
     }
 
-    /// Applies a snapshot record to this state.
+    /// Applies snapshot data to this state.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
         let current_entries = self.log.entries();
         if snapshot.last_included.index < current_entries.prev_position().index {
@@ -498,7 +548,7 @@ enum Record {
     CurrentTerm(noraft::Term),
     VotedFor(Option<noraft::NodeId>),
     Append(LogAppend),
-    Snapshot(Snapshot),
+    SnapshotCheckpoint(SnapshotCheckpoint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,6 +710,12 @@ struct SegmentPath {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RecordPosition {
+    segment: SegmentName,
+    offset: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Manifest {
     active_append_segment: SegmentName,
@@ -771,7 +827,10 @@ fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result
             Ok(())
         }
         Record::Append(append) => state.apply_append_owned(append),
-        Record::Snapshot(snapshot) => state.apply_snapshot(snapshot),
+        Record::SnapshotCheckpoint(checkpoint) => {
+            *state = checkpoint.into_state()?;
+            Ok(())
+        }
     }
 }
 
@@ -780,10 +839,21 @@ fn replay_node_state(
     active_segment: SegmentName,
     node_id: noraft::NodeId,
 ) -> io::Result<StorageState> {
+    let mut target_nodes = BTreeSet::new();
+    target_nodes.insert(node_id);
+    let checkpoint_positions = find_checkpoint_positions(dir, active_segment, Some(&target_nodes))?;
+    let checkpoint_position = checkpoint_positions.get(&node_id).copied();
+
     let mut state = StorageState::default();
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        replay_node_segment(&segment.path, allow_partial, node_id, &mut state)?;
+        replay_node_segment(
+            &segment,
+            allow_partial,
+            node_id,
+            checkpoint_position,
+            &mut state,
+        )?;
     }
     Ok(state)
 }
@@ -793,10 +863,17 @@ fn replay_storage_dir(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
 ) -> io::Result<ReplayState> {
+    let checkpoint_positions = find_checkpoint_positions(dir, active_segment, node_filter)?;
     let mut replay = ReplayState::default();
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        replay_segment(&segment.path, allow_partial, node_filter, &mut replay)?;
+        replay_segment(
+            &segment,
+            allow_partial,
+            node_filter,
+            &checkpoint_positions,
+            &mut replay,
+        )?;
     }
     Ok(replay)
 }
@@ -834,16 +911,75 @@ fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>> {
     Ok(paths)
 }
 
-fn replay_segment(
-    path: &Path,
+fn find_checkpoint_positions(
+    dir: &Path,
+    active_segment: SegmentName,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
+    let mut checkpoints = BTreeMap::new();
+    for segment in discover_segment_paths(dir)? {
+        let allow_partial = segment.name == active_segment;
+        scan_checkpoint_positions(&segment, allow_partial, node_filter, &mut checkpoints)?;
+    }
+    Ok(checkpoints)
+}
+
+fn scan_checkpoint_positions(
+    segment: &SegmentPath,
     allow_partial: bool,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    checkpoints: &mut BTreeMap<noraft::NodeId, RecordPosition>,
+) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(allow_partial)
+        .open(&segment.path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let file_len = file.metadata()?.len();
+
+    loop {
+        let record_start = file.stream_position()?;
+        let Some(body) = read_record_body(&mut file)? else {
+            if record_start == file_len {
+                break;
+            }
+            if allow_partial {
+                file.set_len(record_start)?;
+                file.seek(SeekFrom::Start(record_start))?;
+                break;
+            }
+            return Err(invalid_data("partial record in inactive segment"));
+        };
+
+        let node_id = decode_record_node_id(&body)?;
+        if node_filter.is_none_or(|nodes| nodes.contains(&node_id)) {
+            let node_record = decode_node_record(&body)?;
+            if matches!(node_record.record, Record::SnapshotCheckpoint(_)) {
+                checkpoints.insert(
+                    node_id,
+                    RecordPosition {
+                        segment: segment.name,
+                        offset: record_start,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn replay_segment(
+    segment: &SegmentPath,
+    allow_partial: bool,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    checkpoint_positions: &BTreeMap<noraft::NodeId, RecordPosition>,
     replay: &mut ReplayState,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
-        .open(path)?;
+        .open(&segment.path)?;
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
 
@@ -862,6 +998,16 @@ fn replay_segment(
         };
         let node_id = decode_record_node_id(&body)?;
         if node_filter.is_none_or(|nodes| nodes.contains(&node_id)) {
+            let record_position = RecordPosition {
+                segment: segment.name,
+                offset: record_start,
+            };
+            if checkpoint_positions
+                .get(&node_id)
+                .is_some_and(|checkpoint| record_position < *checkpoint)
+            {
+                continue;
+            }
             replay.apply(decode_node_record(&body)?)?;
         }
     }
@@ -870,15 +1016,16 @@ fn replay_segment(
 }
 
 fn replay_node_segment(
-    path: &Path,
+    segment: &SegmentPath,
     allow_partial: bool,
     target_node_id: noraft::NodeId,
+    checkpoint_position: Option<RecordPosition>,
     state: &mut StorageState,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
-        .open(path)?;
+        .open(&segment.path)?;
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
 
@@ -897,6 +1044,13 @@ fn replay_node_segment(
         };
 
         if decode_record_node_id(&body)? == target_node_id {
+            let record_position = RecordPosition {
+                segment: segment.name,
+                offset: record_start,
+            };
+            if checkpoint_position.is_some_and(|checkpoint| record_position < checkpoint) {
+                continue;
+            }
             apply_record_to_state(state, decode_node_record(&body)?.record)?;
         }
     }
@@ -1103,9 +1257,9 @@ fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
             encoder.put_u8(2);
             encode_log_append(append, encoder)?;
         }
-        Record::Snapshot(snapshot) => {
+        Record::SnapshotCheckpoint(checkpoint) => {
             encoder.put_u8(3);
-            encode_snapshot(snapshot, encoder)?;
+            encode_snapshot_checkpoint(checkpoint, encoder)?;
         }
     }
     Ok(())
@@ -1118,7 +1272,7 @@ fn decode_node_record(bytes: &[u8]) -> io::Result<NodeRecord> {
         0 => Record::CurrentTerm(decode_term(&mut decoder)?),
         1 => Record::VotedFor(decode_optional_node_id(&mut decoder)?),
         2 => Record::Append(decode_log_append(&mut decoder)?),
-        3 => Record::Snapshot(decode_snapshot(&mut decoder)?),
+        3 => Record::SnapshotCheckpoint(decode_snapshot_checkpoint(&mut decoder)?),
         _ => return Err(invalid_data("unknown segment record tag")),
     };
     decoder.finish()?;
@@ -1174,6 +1328,30 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<Snapshot> {
         config: decode_cluster_config(decoder)?,
         data: Bytes::from(decoder.get_bytes()?),
     })
+}
+
+fn encode_snapshot_checkpoint(
+    checkpoint: &SnapshotCheckpoint,
+    encoder: &mut Encoder,
+) -> io::Result<()> {
+    checkpoint.validate()?;
+    encode_term(checkpoint.current_term, encoder);
+    encode_optional_node_id(checkpoint.voted_for, encoder);
+    encode_snapshot(&checkpoint.snapshot, encoder)?;
+    encode_log_append(&checkpoint.suffix, encoder)
+}
+
+fn decode_snapshot_checkpoint(decoder: &mut Decoder<'_>) -> io::Result<SnapshotCheckpoint> {
+    let checkpoint = SnapshotCheckpoint {
+        current_term: decode_term(decoder)?,
+        voted_for: decode_optional_node_id(decoder)?,
+        snapshot: decode_snapshot(decoder)?,
+        suffix: decode_log_append(decoder)?,
+    };
+    checkpoint
+        .validate()
+        .map_err(|_| invalid_data("invalid snapshot checkpoint"))?;
+    Ok(checkpoint)
 }
 
 fn encode_log_entries(entries: &noraft::LogEntries, encoder: &mut Encoder) -> io::Result<()> {

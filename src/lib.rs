@@ -10,4 +10,6 @@ mod storage;
 
 pub use bytes::Bytes;
 pub use registry::NodeMetadata;
-pub use storage::{LogAppend, Snapshot, StorageEngine, StorageState, SyncPolicy};
+pub use storage::{
+    LogAppend, Snapshot, SnapshotCheckpoint, StorageEngine, StorageState, SyncPolicy,
+};

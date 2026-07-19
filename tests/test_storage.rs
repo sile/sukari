@@ -1,4 +1,7 @@
-use sukari::{Bytes, LogAppend, NodeMetadata, Snapshot, StorageEngine, StorageState, SyncPolicy};
+use sukari::{
+    Bytes, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine, StorageState,
+    SyncPolicy,
+};
 
 use std::{
     collections::BTreeMap,
@@ -130,6 +133,18 @@ fn storage_engine_rejects_uncreated_nodes() {
             ),
         )
         .expect_err("uncreated node should reject log appends");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    let err = engine
+        .save_snapshot(
+            node_id,
+            checkpoint(
+                noraft::Term::new(1),
+                None,
+                snapshot(noraft::LogPosition::ZERO, b"checkpoint"),
+                append(noraft::LogPosition::ZERO, std::iter::empty(), []),
+            ),
+        )
+        .expect_err("uncreated node should reject checkpoint writes");
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
@@ -530,7 +545,7 @@ fn storage_engine_replays_snapshots() {
         StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
     create_node(&mut engine, 3);
 
-    let append = append(
+    let initial_append = append(
         position(0, 0),
         [
             noraft::LogEntry::Term(noraft::Term::new(2)),
@@ -543,16 +558,21 @@ fn storage_engine_replays_snapshots() {
         ],
     );
     engine
-        .append_entries(noraft::NodeId::new(3), append)
+        .append_entries(noraft::NodeId::new(3), initial_append)
         .expect("entries should be stored");
 
-    let snapshot = Snapshot {
-        last_included: position(2, 2),
-        config: noraft::ClusterConfig::new(),
-        data: Bytes::from(b"snapshot".as_slice()),
-    };
+    let checkpoint = checkpoint(
+        noraft::Term::new(2),
+        None,
+        snapshot(position(2, 2), b"snapshot"),
+        append(
+            position(2, 2),
+            [noraft::LogEntry::Command],
+            [(3, Bytes::from(b"three".as_slice()))],
+        ),
+    );
     engine
-        .save_snapshot(noraft::NodeId::new(3), snapshot)
+        .save_snapshot(noraft::NodeId::new(3), checkpoint)
         .expect("snapshot should be stored");
     drop(engine);
 
@@ -575,6 +595,152 @@ fn storage_engine_replays_snapshots() {
             .as_slice(),
         b"snapshot"
     );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_replays_snapshot_checkpoints() {
+    let dir = unique_temp_dir("sukari-storage-checkpoint");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 3);
+
+    engine
+        .save_current_term(noraft::NodeId::new(3), noraft::Term::new(1))
+        .expect("old term should be stored");
+    engine
+        .save_voted_for(noraft::NodeId::new(3), Some(noraft::NodeId::new(2)))
+        .expect("old vote should be stored");
+    let old_append = append(
+        position(0, 0),
+        [noraft::LogEntry::Command],
+        [(1, Bytes::from(b"old-command".as_slice()))],
+    );
+    engine
+        .append_entries(noraft::NodeId::new(3), old_append)
+        .expect("old append should be stored");
+
+    let checkpoint = checkpoint(
+        noraft::Term::new(8),
+        Some(noraft::NodeId::new(7)),
+        snapshot(position(3, 3), b"checkpoint-snapshot"),
+        append(
+            position(3, 3),
+            [
+                noraft::LogEntry::Term(noraft::Term::new(4)),
+                noraft::LogEntry::Command,
+            ],
+            [(5, Bytes::from(b"checkpoint-command".as_slice()))],
+        ),
+    );
+    engine
+        .save_snapshot(noraft::NodeId::new(3), checkpoint)
+        .expect("checkpoint should be stored");
+
+    let later_append = append(
+        position(4, 5),
+        [noraft::LogEntry::Command],
+        [(6, Bytes::from(b"later-command".as_slice()))],
+    );
+    engine
+        .append_entries(noraft::NodeId::new(3), later_append)
+        .expect("later append should be stored");
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let state = engine
+        .load(noraft::NodeId::new(3))
+        .expect("node state should load");
+    assert_eq!(state.current_term, noraft::Term::new(8));
+    assert_eq!(state.voted_for, Some(noraft::NodeId::new(7)));
+    assert_eq!(state.log.entries().prev_position(), position(3, 3));
+    assert_eq!(state.log.entries().last_position(), position(4, 6));
+    assert_eq!(state.commands.get(&index(1)), None);
+    assert_eq!(
+        state.commands.get(&index(5)).map(Bytes::as_slice),
+        Some(&b"checkpoint-command"[..])
+    );
+    assert_eq!(
+        state.commands.get(&index(6)).map(Bytes::as_slice),
+        Some(&b"later-command"[..])
+    );
+    assert_eq!(
+        state
+            .snapshot
+            .expect("checkpoint snapshot should be loaded")
+            .data
+            .as_slice(),
+        b"checkpoint-snapshot"
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_checkpoint_ignores_older_invalid_append() {
+    let dir = unique_temp_dir("sukari-storage-checkpoint-invalid-old");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+
+    let invalid_old_append = append(
+        position(9, 9),
+        [noraft::LogEntry::Term(noraft::Term::new(10))],
+        [],
+    );
+    engine
+        .append_entries(noraft::NodeId::new(1), invalid_old_append)
+        .expect("invalid old append should be stored");
+    engine
+        .save_snapshot(
+            noraft::NodeId::new(1),
+            checkpoint(
+                noraft::Term::new(3),
+                None,
+                snapshot(noraft::LogPosition::ZERO, b"checkpoint"),
+                append(noraft::LogPosition::ZERO, std::iter::empty(), []),
+            ),
+        )
+        .expect("checkpoint should be stored");
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let state = engine
+        .load(noraft::NodeId::new(1))
+        .expect("checkpoint should supersede the invalid old append");
+    assert_eq!(state.current_term, noraft::Term::new(3));
+    assert_eq!(
+        state.log.entries().last_position(),
+        noraft::LogPosition::ZERO
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rejects_invalid_snapshot_checkpoints() {
+    let dir = unique_temp_dir("sukari-storage-invalid-checkpoint");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+
+    let err = engine
+        .save_snapshot(
+            noraft::NodeId::new(1),
+            checkpoint(
+                noraft::Term::new(3),
+                None,
+                snapshot(position(2, 2), b"checkpoint"),
+                append(
+                    position(1, 1),
+                    [noraft::LogEntry::Term(noraft::Term::new(2))],
+                    [],
+                ),
+            ),
+        )
+        .expect_err("checkpoint suffix should start at the snapshot position");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -759,6 +925,28 @@ where
             .collect(),
     )
     .expect("append should have matching command payloads")
+}
+
+fn snapshot(last_included: noraft::LogPosition, data: &[u8]) -> Snapshot {
+    Snapshot {
+        last_included,
+        config: noraft::ClusterConfig::new(),
+        data: Bytes::from(data),
+    }
+}
+
+fn checkpoint(
+    current_term: noraft::Term,
+    voted_for: Option<noraft::NodeId>,
+    snapshot: Snapshot,
+    suffix: LogAppend,
+) -> SnapshotCheckpoint {
+    SnapshotCheckpoint {
+        current_term,
+        voted_for,
+        snapshot,
+        suffix,
+    }
 }
 
 fn create_node(engine: &mut StorageEngine, node_id: u64) {

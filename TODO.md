@@ -14,11 +14,9 @@
 ## Segment Format
 
 - Document the `SKR1` format once the first release boundary is clear.
-- Define the snapshot checkpoint record encoding.
 
 ## Replay
 
-- Implement replay semantics for snapshot checkpoint records.
 - Decide whether inactive segments should ever tolerate trailing partial records.
 
 ## Compaction And Garbage Collection

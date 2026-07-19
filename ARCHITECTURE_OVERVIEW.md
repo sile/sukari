@@ -33,7 +33,6 @@ the storage operations commonly emitted by `noraft`-based runtimes:
 - save current term
 - save voted-for node
 - append log entries and command payloads
-- save latest snapshot state
 - save snapshot checkpoints that supersede earlier node records
 - replay a node's persistent state at startup
 - mark a node removed and reserve its node ID
@@ -113,7 +112,7 @@ The current record kinds are:
 - current term
 - voted-for node
 - log append
-- snapshot
+- snapshot checkpoint
 
 `SKR1` is unstable while the crate is unreleased. Incompatible storage changes
 can still move to a new magic value if keeping experimental data is not useful.
@@ -216,11 +215,12 @@ still discover segment files and must not depend only on the manifest.
 
 ## Snapshot Checkpoints
 
-The full design should add a snapshot checkpoint operation. A checkpoint is
-stronger than saving a snapshot alone: it records a complete recovery point for
-one node and declares that earlier records for that node are no longer needed.
+The current implementation provides a snapshot checkpoint operation. A
+checkpoint is stronger than saving a snapshot alone: it records a complete
+recovery point for one node and declares that earlier records for that node are
+no longer needed.
 
-The intended API shape is:
+The API shape is:
 
 ```rust
 pub struct SnapshotCheckpoint {
@@ -230,7 +230,7 @@ pub struct SnapshotCheckpoint {
     pub suffix: LogAppend,
 }
 
-pub fn save_snapshot_checkpoint(
+pub fn save_snapshot(
     &mut self,
     node_id: noraft::NodeId,
     checkpoint: SnapshotCheckpoint,
@@ -243,10 +243,6 @@ log entries after the snapshot position, it must include them in the checkpoint
 suffix or append them again after the checkpoint has been saved. Replay may
 ignore older records for the same node once it sees a valid checkpoint. The
 checkpoint suffix should start at the snapshot's last included position.
-
-`save_snapshot()` remains a plain snapshot record. It should not by itself
-advance garbage-collection metadata because it does not necessarily include
-current term, voted-for node, or a complete retained suffix.
 
 ## Replay
 
