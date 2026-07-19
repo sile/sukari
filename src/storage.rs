@@ -47,7 +47,6 @@ pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
     writer: SegmentWriter,
-    replay: ReplayState,
 }
 
 impl StorageEngine {
@@ -56,27 +55,24 @@ impl StorageEngine {
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir, sync)?;
         let active_segment = SegmentName::first_append();
-        let replay = replay_storage_dir(&dir, active_segment)?;
+        recover_storage_dir(&dir, active_segment)?;
         let writer = SegmentWriter::open(&dir, sync, active_segment)?;
-        Ok(Self {
-            dir,
-            sync,
-            writer,
-            replay,
-        })
+        Ok(Self { dir, sync, writer })
     }
 
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
-        if self.replay.removed_nodes.contains(&node_id) {
+        let mut replay = replay_storage_dir(&self.dir, SegmentName::first_append())?;
+        if replay.removed_nodes.contains(&node_id) {
             return Err(node_removed_error());
         }
-        Ok(self.replay.nodes.get(&node_id).cloned().unwrap_or_default())
+        Ok(replay.nodes.remove(&node_id).unwrap_or_default())
     }
 
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
-        Ok(self.replay.nodes.clone())
+        let replay = replay_storage_dir(&self.dir, SegmentName::first_append())?;
+        Ok(replay.nodes)
     }
 
     /// Saves the current term for the given Raft node.
@@ -109,14 +105,7 @@ impl StorageEngine {
 
     /// Records removal of all durable data for the given Raft node.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
-        if self.replay.removed_nodes.contains(&node_id) {
-            return Ok(());
-        }
-
-        let record = Record::NodeRemoved;
-        self.writer.append(node_id, &record)?;
-        self.replay.apply(NodeRecord { node_id, record })?;
-        Ok(())
+        self.writer.append(node_id, &Record::NodeRemoved)
     }
 
     /// Flushes pending writes.
@@ -141,15 +130,7 @@ impl StorageEngine {
     }
 
     fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
-        if self.replay.removed_nodes.contains(&node_id) {
-            return Err(node_removed_error());
-        }
-
-        let mut next_state = self.replay.nodes.get(&node_id).cloned().unwrap_or_default();
-        apply_record_to_state(&mut next_state, &record)?;
-        self.writer.append(node_id, &record)?;
-        self.replay.nodes.insert(node_id, next_state);
-        Ok(())
+        self.writer.append(node_id, &record)
     }
 }
 
@@ -335,6 +316,10 @@ impl StorageState {
 
     /// Applies a log append record to this state.
     pub fn apply_append(&mut self, append: &LogAppend) -> io::Result<()> {
+        self.apply_append_owned(append.clone())
+    }
+
+    fn apply_append_owned(&mut self, append: LogAppend) -> io::Result<()> {
         append.validate()?;
         if !self.log.entries().contains(append.entries.prev_position()) {
             return Err(invalid_data("append anchor does not exist in local log"));
@@ -354,7 +339,7 @@ impl StorageState {
 
         let prev_index = append.entries.prev_position().index;
         self.commands.retain(|index, _| *index <= prev_index);
-        self.commands.extend(append.commands.clone());
+        self.commands.extend(append.commands);
         Ok(())
     }
 
@@ -493,33 +478,34 @@ struct ReplayState {
 
 impl ReplayState {
     fn apply(&mut self, node_record: NodeRecord) -> io::Result<()> {
-        if node_record.record == Record::NodeRemoved {
-            self.nodes.remove(&node_record.node_id);
-            self.removed_nodes.insert(node_record.node_id);
-            return Ok(());
+        let NodeRecord { node_id, record } = node_record;
+        match record {
+            Record::NodeRemoved => {
+                self.nodes.remove(&node_id);
+                self.removed_nodes.insert(node_id);
+                Ok(())
+            }
+            _ if self.removed_nodes.contains(&node_id) => Ok(()),
+            record => {
+                let state = self.nodes.entry(node_id).or_default();
+                apply_record_to_state(state, record)
+            }
         }
-
-        if self.removed_nodes.contains(&node_record.node_id) {
-            return Ok(());
-        }
-
-        let state = self.nodes.entry(node_record.node_id).or_default();
-        apply_record_to_state(state, &node_record.record)
     }
 }
 
-fn apply_record_to_state(state: &mut StorageState, record: &Record) -> io::Result<()> {
+fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result<()> {
     match record {
         Record::CurrentTerm(term) => {
-            state.apply_current_term(*term);
+            state.apply_current_term(term);
             Ok(())
         }
         Record::VotedFor(voted_for) => {
-            state.apply_voted_for(*voted_for);
+            state.apply_voted_for(voted_for);
             Ok(())
         }
-        Record::Append(append) => state.apply_append(append),
-        Record::Snapshot(snapshot) => state.apply_snapshot(snapshot.clone()),
+        Record::Append(append) => state.apply_append_owned(append),
+        Record::Snapshot(snapshot) => state.apply_snapshot(snapshot),
         Record::NodeRemoved => Ok(()),
     }
 }
@@ -531,6 +517,14 @@ fn replay_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<Rep
         replay_segment(&segment.path, allow_partial, &mut replay)?;
     }
     Ok(replay)
+}
+
+fn recover_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<()> {
+    for segment in discover_segment_paths(dir)? {
+        let allow_partial = segment.name == active_segment;
+        scan_segment(&segment.path, allow_partial)?;
+    }
+    Ok(())
 }
 
 fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>> {
@@ -579,6 +573,81 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
     }
 
     Ok(())
+}
+
+fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(allow_partial)
+        .open(path)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    loop {
+        let record_start = file.stream_position()?;
+        if scan_record_frame(&mut file)?.is_some() {
+            continue;
+        }
+
+        if allow_partial {
+            file.set_len(record_start)?;
+            file.seek(SeekFrom::Start(record_start))?;
+            break;
+        }
+        return Err(invalid_data("partial record in inactive segment"));
+    }
+
+    Ok(())
+}
+
+fn scan_record_frame(file: &mut File) -> io::Result<Option<()>> {
+    let mut header = [0; SEGMENT_BASE_HEADER_LEN];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    if &header[..4] != SEGMENT_FORMAT_MAGIC {
+        return Err(invalid_data("unsupported segment format"));
+    }
+
+    let body_len = u32::from_le_bytes(
+        header[4..8]
+            .try_into()
+            .expect("segment header length should be four bytes"),
+    );
+    if MAX_RECORD_LEN < body_len {
+        return Err(invalid_data("segment record is too large"));
+    }
+
+    let mut checksum = [0; SEGMENT_CHECKSUM_LEN];
+    match file.read_exact(&mut checksum) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let expected_checksum = u32::from_le_bytes(checksum);
+
+    let mut crc = crc32c_initial();
+    let mut remaining = u64::from(body_len);
+    let mut buffer = [0; 8192];
+    while remaining != 0 {
+        let read_len = remaining.min(buffer.len() as u64) as usize;
+        match file.read_exact(&mut buffer[..read_len]) {
+            Ok(()) => {
+                crc = crc32c_extend(crc, &buffer[..read_len]);
+                remaining -= read_len as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+
+    if crc32c_finish(crc) != expected_checksum {
+        return Err(invalid_data("segment record checksum mismatch"));
+    }
+
+    Ok(Some(()))
 }
 
 fn open_active_segment_file(path: &Path) -> io::Result<File> {
@@ -933,11 +1002,22 @@ const fn make_crc32c_table() -> [u32; 256] {
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF;
+    crc32c_finish(crc32c_extend(crc32c_initial(), bytes))
+}
+
+fn crc32c_initial() -> u32 {
+    0xFFFF_FFFF
+}
+
+fn crc32c_extend(mut crc: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         let index = ((crc ^ u32::from(*byte)) & 0xFF) as usize;
         crc = (crc >> 8) ^ CRC32C_TABLE[index];
     }
+    crc
+}
+
+fn crc32c_finish(crc: u32) -> u32 {
     !crc
 }
 

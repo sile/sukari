@@ -131,6 +131,29 @@ fn storage_engine_replays_records_for_multiple_nodes() {
 }
 
 #[test]
+fn storage_engine_does_not_validate_log_anchor_before_write() {
+    let dir = unique_temp_dir("sukari-storage-raw-append");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+
+    let append = append(
+        position(9, 9),
+        [noraft::LogEntry::Term(noraft::Term::new(10))],
+        [],
+    );
+    engine
+        .append_entries(noraft::NodeId::new(1), append)
+        .expect("append should be stored without consulting current state");
+
+    let err = engine
+        .load(noraft::NodeId::new(1))
+        .expect_err("invalid replay stream should fail when loaded");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_engine_replays_snapshots() {
     let dir = unique_temp_dir("sukari-storage-snapshot");
     let mut engine =
