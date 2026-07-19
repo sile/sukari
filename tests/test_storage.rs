@@ -1,5 +1,5 @@
 use sukari::{
-    Bytes, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine, StorageState,
+    Bytes, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
     SyncPolicy,
 };
 
@@ -793,8 +793,8 @@ fn storage_engine_does_not_collect_after_node_creation() {
 }
 
 #[test]
-fn storage_state_applies_log_suffix_replacement() {
-    let mut state = StorageState::default();
+fn node_state_applies_log_suffix_replacement() {
+    let mut state = NodeState::default();
     let mut commands = BTreeMap::new();
     commands.insert(noraft::LogIndex::new(2), Bytes::from(b"old-2".as_slice()));
     commands.insert(noraft::LogIndex::new(3), Bytes::from(b"old-3".as_slice()));

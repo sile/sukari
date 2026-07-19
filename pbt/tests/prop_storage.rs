@@ -6,7 +6,7 @@ use std::{
 
 use proptest::prelude::*;
 use sukari::{
-    Bytes, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine, StorageState,
+    Bytes, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
     SyncPolicy,
 };
 
@@ -155,7 +155,7 @@ fn node_set(ids: Vec<u64>) -> BTreeSet<noraft::NodeId> {
     ids.into_iter().map(noraft::NodeId::new).collect()
 }
 
-fn log_positions(state: &StorageState) -> Vec<noraft::LogPosition> {
+fn log_positions(state: &NodeState) -> Vec<noraft::LogPosition> {
     std::iter::once(state.log.entries().prev_position())
         .chain(
             state
@@ -167,7 +167,7 @@ fn log_positions(state: &StorageState) -> Vec<noraft::LogPosition> {
         .collect()
 }
 
-fn choose_position(state: &StorageState, choice: usize) -> noraft::LogPosition {
+fn choose_position(state: &NodeState, choice: usize) -> noraft::LogPosition {
     let positions = log_positions(state);
     positions[choice % positions.len()]
 }
@@ -197,8 +197,8 @@ fn log_append(prev_position: noraft::LogPosition, entries: Vec<GeneratedEntry>) 
     .expect("generated append should have matching command payloads")
 }
 
-fn initial_state() -> StorageState {
-    let mut state = StorageState::default();
+fn initial_state() -> NodeState {
+    let mut state = NodeState::default();
     state
         .apply_snapshot(Snapshot {
             last_included: noraft::LogPosition::ZERO,
@@ -209,7 +209,7 @@ fn initial_state() -> StorageState {
     state
 }
 
-fn apply_operation(engine: &mut StorageEngine, expected: &mut StorageState, operation: Operation) {
+fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operation: Operation) {
     match operation {
         Operation::CurrentTerm(term) => {
             let term = noraft::Term::new(term);

@@ -135,7 +135,7 @@ impl StorageEngine {
     }
 
     /// Loads the current state for the given Raft node.
-    pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
+    pub fn load(&self, node_id: noraft::NodeId) -> io::Result<NodeState> {
         self.ensure_node_exists(node_id)?;
         replay_node_state(
             &self.dir,
@@ -146,7 +146,7 @@ impl StorageEngine {
     }
 
     /// Loads the latest state of all non-removed nodes.
-    pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
+    pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, NodeState>> {
         let active_node_ids = self.registry.active_node_ids();
         if active_node_ids.is_empty() {
             return Ok(BTreeMap::new());
@@ -514,9 +514,9 @@ impl SnapshotCheckpoint {
         Ok(())
     }
 
-    fn into_state(self) -> io::Result<StorageState> {
+    fn into_state(self) -> io::Result<NodeState> {
         self.validate()?;
-        let mut state = StorageState::default();
+        let mut state = NodeState::default();
         state.apply_current_term(self.current_term);
         state.apply_voted_for(self.voted_for);
         state.apply_snapshot(self.snapshot)?;
@@ -544,7 +544,7 @@ fn initial_checkpoint() -> SnapshotCheckpoint {
 
 /// Loaded persistent state for a Raft node.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageState {
+pub struct NodeState {
     /// Current term.
     pub current_term: noraft::Term,
 
@@ -561,7 +561,7 @@ pub struct StorageState {
     pub snapshot: Option<Snapshot>,
 }
 
-impl Default for StorageState {
+impl Default for NodeState {
     fn default() -> Self {
         Self {
             current_term: noraft::Term::ZERO,
@@ -576,7 +576,7 @@ impl Default for StorageState {
     }
 }
 
-impl StorageState {
+impl NodeState {
     /// Applies a current-term record to this state.
     pub fn apply_current_term(&mut self, term: noraft::Term) {
         self.current_term = term;
@@ -1148,7 +1148,7 @@ fn validate_checkpoint_position(
 
 #[derive(Debug, Default)]
 struct ReplayState {
-    nodes: BTreeMap<noraft::NodeId, StorageState>,
+    nodes: BTreeMap<noraft::NodeId, NodeState>,
 }
 
 impl ReplayState {
@@ -1159,7 +1159,7 @@ impl ReplayState {
     }
 }
 
-fn apply_record_to_state(state: &mut StorageState, record: Record) -> io::Result<()> {
+fn apply_record_to_state(state: &mut NodeState, record: Record) -> io::Result<()> {
     match record {
         Record::CurrentTerm(term) => {
             state.apply_current_term(term);
@@ -1182,14 +1182,14 @@ fn replay_node_state(
     active_segment: SegmentName,
     node_id: noraft::NodeId,
     checkpoint_hint: Option<RecordPosition>,
-) -> io::Result<StorageState> {
+) -> io::Result<NodeState> {
     let mut target_nodes = BTreeSet::new();
     target_nodes.insert(node_id);
     let checkpoint_positions =
         find_checkpoint_positions_from(dir, active_segment, Some(&target_nodes), checkpoint_hint)?;
     let checkpoint_position = checkpoint_positions.get(&node_id).copied();
 
-    let mut state = StorageState::default();
+    let mut state = NodeState::default();
     for segment in discover_segment_paths(dir)? {
         if checkpoint_position.is_some_and(|checkpoint| segment.name < checkpoint.segment) {
             continue;
@@ -1424,7 +1424,7 @@ fn replay_node_segment(
     allow_partial: bool,
     target_node_id: noraft::NodeId,
     checkpoint_position: Option<RecordPosition>,
-    state: &mut StorageState,
+    state: &mut NodeState,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
