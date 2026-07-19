@@ -10,3 +10,8 @@ storage format, replay, compaction, and recovery details.
 
 This crate is currently under initial development.
 The public API and on-disk format are not ready for use yet.
+
+## Documents
+
+- [Architecture overview](docs/architecture-overview.md)
+- [Segment format](docs/segment-format.md)

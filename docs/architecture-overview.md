@@ -98,24 +98,8 @@ currently loaded log before writing. Divergent log suffixes caused by leader
 changes are reconciled by deterministic replay, which applies records in their
 original append order.
 
-Each segment record uses the `SKR1` frame format:
-
-- magic
-- body length
-- CRC-32C checksum of the body
-- node ID
-- record kind
-- encoded payload
-
-The current record kinds are:
-
-- current term
-- voted-for node
-- log append
-- snapshot checkpoint
-
-`SKR1` is unstable while the crate is unreleased. Incompatible storage changes
-can still move to a new magic value if keeping experimental data is not useful.
+The on-disk segment record format is specified in
+[segment-format.md](segment-format.md).
 
 ## Future Layout
 
