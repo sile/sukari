@@ -50,6 +50,7 @@ one active shared append segment at a time:
 
 ```text
 storage/
+  nodes.json
   append-000001.segment
   append-000002.segment
 ```
@@ -63,6 +64,9 @@ the limit is written to an empty segment by itself.
 The public API exposes node ID based storage operations on a single engine
 writer:
 
+- create a node with startup metadata
+- inspect active node metadata
+- inspect startup nodes
 - load a node state
 - save current term
 - save voted-for node
@@ -70,8 +74,12 @@ writer:
 - save snapshot state
 - flush pending writes
 - load all non-removed node states
-- record a node removal tombstone
+- remove a node and reserve its node ID
 - remove all storage data
+
+Storage operations for node state fail unless the target node ID has been
+created with `create_node()`. Removed node IDs are permanently reserved and
+cannot be created again.
 
 `sukari` does not add internal mutexes around writes. Callers that need
 concurrent runtime integration should own serialization outside this crate, for
@@ -119,7 +127,7 @@ storage/
 
 ## Node Registry
 
-The intended design includes a small JSON node registry file:
+The current implementation stores a small JSON node registry file:
 
 ```text
 storage/
@@ -131,19 +139,38 @@ storage/
 The registry records which `noraft::NodeId` values are valid for this storage
 instance. Nodes are added with `create_node()` and removed with `remove_node()`.
 Storage operations such as `load()`, `save_current_term()`, `save_voted_for()`,
-`append_entries()`, and `save_snapshot()` should fail for node IDs that have not
-been created.
+`append_entries()`, and `save_snapshot()` fail for node IDs that have not been
+created.
+
+`nodes.json` currently has this schema:
+
+```json
+{
+  "version": 1,
+  "nodes": {
+    "1": {
+      "startup": true,
+      "metadata": { "role": "control" },
+      "removed": false
+    }
+  }
+}
+```
+
+Node IDs are encoded as decimal string keys. The `removed` flag keeps removed
+node IDs reserved, so `create_node()` rejects an ID even after `remove_node()`
+has marked it as removed.
 
 Each node entry should contain a typed `startup` flag and opaque JSON metadata.
 The `startup` flag means the node should be considered during process startup
 before any external control plane has been loaded. The metadata JSON is
-application-defined and should be stored and returned without interpretation by
-`sukari`. The JSON representation should use the `nojson` crate.
+application-defined. `sukari` validates it with the `nojson` crate and writes the
+raw JSON value without interpreting it.
 
-`nodes.json` should contain all node entries in one small file and be updated by
-atomic replacement. The update protocol should write a temporary file, sync it,
-rename it over `nodes.json`, and sync the parent directory when the sync policy
-requires durable metadata.
+`nodes.json` contains all node entries in one small file and is updated by
+atomic replacement. The update protocol writes `nodes.json.tmp`, syncs it,
+renames it over `nodes.json`, and syncs the parent directory when the sync
+policy requires durable metadata.
 
 The registry is a storage namespace and startup-discovery mechanism. It is not
 the authoritative Raft cluster membership, group placement, or orchestration

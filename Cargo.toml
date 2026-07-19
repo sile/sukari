@@ -13,3 +13,5 @@ keywords = ["raft", "storage", "wal", "multi-raft"]
 [dependencies]
 # Core Raft state machine and protocol types.
 noraft = { git = "https://github.com/sile/noraft", branch = "main" }
+# Node registry JSON parsing and formatting.
+nojson = "0.3"

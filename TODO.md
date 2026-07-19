@@ -10,16 +10,7 @@
 
 - Decide whether loaded command and snapshot payloads should stay as `Vec<u8>`
   wrappers or move to a shared representation.
-- Add node registry APIs: `create_node()`, `remove_node()`, and metadata loading.
-- Reject storage operations for node IDs that have not been created.
 - Revisit node tombstone behavior after the first runtime integration.
-- Decide whether `load_all()` should expose removed node IDs to callers.
-
-## Node Registry
-
-- Define the `nojson`-backed `nodes.json` schema.
-- Define atomic replacement and sync rules for `nodes.json`.
-- Decide whether removed node IDs are permanently reserved.
 
 ## Segment Format
 
@@ -46,5 +37,5 @@
 - Expand focused unit tests for explicit error paths.
 - Add property-based tests for record encoding and replay round trips.
 - Add fuzzing for arbitrary segment input.
-- Add crash-recovery tests for manifest, segment rotation, rewrite completion,
-  and deletion ordering.
+- Add crash-recovery tests for `nodes.json`, manifest, segment rotation,
+  rewrite completion, and deletion ordering.

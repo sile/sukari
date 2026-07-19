@@ -1,6 +1,7 @@
 //! Shared segmented storage model for Raft node state.
 
 use crate::bytes::Bytes;
+use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_removed_error};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,6 +48,7 @@ pub enum SyncPolicy {
 pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
+    registry: NodeRegistry,
     writer: SegmentWriter,
 }
 
@@ -73,19 +75,65 @@ impl StorageEngine {
         create_dir_all_synced(&dir, sync)?;
         let active_segment = select_active_append_segment(&dir)?;
         recover_storage_dir(&dir, active_segment)?;
+        let registry = NodeRegistry::load(&dir)?;
         let writer = SegmentWriter::open(&dir, sync, active_segment, max_segment_len)?;
-        Ok(Self { dir, sync, writer })
+        Ok(Self {
+            dir,
+            sync,
+            registry,
+            writer,
+        })
+    }
+
+    /// Creates a Raft node in this storage instance.
+    pub fn create_node(
+        &mut self,
+        node_id: noraft::NodeId,
+        metadata: NodeMetadata,
+    ) -> io::Result<()> {
+        let mut registry = self.registry.clone();
+        registry.create_node(node_id, metadata)?;
+        registry.save(&self.dir, self.sync)?;
+        self.registry = registry;
+        Ok(())
+    }
+
+    /// Returns metadata for an active Raft node.
+    pub fn node_metadata(&self, node_id: noraft::NodeId) -> Option<&NodeMetadata> {
+        self.registry.metadata(node_id)
+    }
+
+    /// Returns all active Raft nodes and their metadata.
+    pub fn nodes(&self) -> impl Iterator<Item = (noraft::NodeId, &NodeMetadata)> + '_ {
+        self.registry.nodes()
+    }
+
+    /// Returns active Raft nodes that should be considered during process startup.
+    pub fn startup_nodes(&self) -> impl Iterator<Item = (noraft::NodeId, &NodeMetadata)> + '_ {
+        self.registry.startup_nodes()
     }
 
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<StorageState> {
+        self.ensure_node_exists(node_id)?;
         replay_node_state(&self.dir, self.writer.active_segment, node_id)
     }
 
     /// Loads the latest state of all non-removed nodes.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, StorageState>> {
-        let replay = replay_storage_dir(&self.dir, self.writer.active_segment)?;
-        Ok(replay.nodes)
+        let active_node_ids = self.registry.active_node_ids();
+        let mut replay = replay_storage_dir(
+            &self.dir,
+            self.writer.active_segment,
+            Some(&active_node_ids),
+        )?;
+        let mut nodes = BTreeMap::new();
+        for node_id in active_node_ids {
+            if !replay.removed_nodes.contains(&node_id) {
+                nodes.insert(node_id, replay.nodes.remove(&node_id).unwrap_or_default());
+            }
+        }
+        Ok(nodes)
     }
 
     /// Saves the current term for the given Raft node.
@@ -118,6 +166,10 @@ impl StorageEngine {
 
     /// Records removal of all durable data for the given Raft node.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
+        let mut registry = self.registry.clone();
+        registry.remove_node(node_id)?;
+        registry.save(&self.dir, self.sync)?;
+        self.registry = registry;
         self.writer.append(node_id, &Record::NodeRemoved)
     }
 
@@ -143,7 +195,18 @@ impl StorageEngine {
     }
 
     fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
+        self.ensure_node_exists(node_id)?;
         self.writer.append(node_id, &record)
+    }
+
+    fn ensure_node_exists(&self, node_id: noraft::NodeId) -> io::Result<()> {
+        if self.registry.is_active(node_id) {
+            return Ok(());
+        }
+        if self.registry.is_removed(node_id) {
+            return Err(node_removed_error());
+        }
+        Err(node_not_found_error())
     }
 }
 
@@ -633,11 +696,15 @@ fn replay_node_state(
     replay.into_storage_state()
 }
 
-fn replay_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<ReplayState> {
+fn replay_storage_dir(
+    dir: &Path,
+    active_segment: SegmentName,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+) -> io::Result<ReplayState> {
     let mut replay = ReplayState::default();
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        replay_segment(&segment.path, allow_partial, &mut replay)?;
+        replay_segment(&segment.path, allow_partial, node_filter, &mut replay)?;
     }
     Ok(replay)
 }
@@ -675,7 +742,12 @@ fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>> {
     Ok(paths)
 }
 
-fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) -> io::Result<()> {
+fn replay_segment(
+    path: &Path,
+    allow_partial: bool,
+    node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    replay: &mut ReplayState,
+) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
@@ -685,7 +757,7 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(record) = read_record(&mut file)? else {
+        let Some(body) = read_record_body(&mut file)? else {
             if record_start == file_len {
                 break;
             }
@@ -696,7 +768,10 @@ fn replay_segment(path: &Path, allow_partial: bool, replay: &mut ReplayState) ->
             }
             return Err(invalid_data("partial record in inactive segment"));
         };
-        replay.apply(record)?;
+        let node_id = decode_record_node_id(&body)?;
+        if node_filter.is_none_or(|nodes| nodes.contains(&node_id)) {
+            replay.apply(decode_node_record(&body)?)?;
+        }
     }
 
     Ok(())
@@ -877,13 +952,6 @@ fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<V
     debug_assert_eq!(frame.len(), SEGMENT_HEADER_LEN);
     frame.extend_from_slice(&body);
     Ok(frame)
-}
-
-fn read_record(file: &mut File) -> io::Result<Option<NodeRecord>> {
-    let Some(body) = read_record_body(file)? else {
-        return Ok(None);
-    };
-    decode_node_record(&body).map(Some)
 }
 
 fn read_record_body(file: &mut File) -> io::Result<Option<Vec<u8>>> {
@@ -1300,10 +1368,6 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn node_removed_error() -> io::Error {
-    io::Error::new(io::ErrorKind::NotFound, "node storage has been removed")
 }
 
 fn remove_storage_dir_if_exists(path: &Path, sync: SyncPolicy) -> io::Result<()> {

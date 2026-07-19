@@ -5,7 +5,9 @@
 #![forbid(unsafe_code)]
 
 mod bytes;
+mod registry;
 mod storage;
 
 pub use bytes::Bytes;
+pub use registry::NodeMetadata;
 pub use storage::{LogAppend, Snapshot, StorageEngine, StorageState, SyncPolicy};
