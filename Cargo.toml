@@ -12,6 +12,7 @@ keywords = ["raft", "storage", "wal", "multi-raft"]
 
 [workspace]
 members = ["pbt"]
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 # Core Raft state machine and protocol types.
