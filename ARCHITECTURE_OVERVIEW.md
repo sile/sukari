@@ -71,6 +71,13 @@ writer:
 concurrent runtime integration should own serialization outside this crate, for
 example by routing storage requests through a dedicated storage task.
 
+Write operations append storage records as they are received. The storage layer
+validates record-local invariants, such as frame checksums and command payload
+mapping, but it should not check whether a log append anchor matches the
+currently loaded log before writing. Divergent log suffixes caused by leader
+changes are reconciled by deterministic replay, which applies records in their
+original append order.
+
 Each segment record uses the `SKR1` frame format:
 
 - magic
@@ -121,6 +128,21 @@ slow, a manifest or hint file can be added later as an accelerator.
 
 The active segment tolerates a trailing partial record and truncates it during
 replay. Checksum mismatches are treated as corruption.
+
+## Memory Model
+
+`StorageEngine` should not keep fully replayed node state in memory for normal
+writes. Opening the engine may scan segment frames for recovery, but full
+`StorageState` construction should happen when `load()` or `load_all()` is
+called.
+
+The initial design assumes that the loaded snapshot payload and the log entries
+after that snapshot fit comfortably in memory. This keeps the storage API simple
+and matches the expected Raft usage. Very large snapshots and large blob
+payloads are poor fits for Raft and are not target use cases. Random-read log
+paging is also not a target use case. Lagging-node catch-up should read the
+already loaded log suffix from memory; synchronous disk reads can block leader
+replication, while asynchronous paging complicates the runtime for little gain.
 
 ## Compaction And Garbage Collection
 
