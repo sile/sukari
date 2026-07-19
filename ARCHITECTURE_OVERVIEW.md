@@ -308,6 +308,39 @@ Lagging-node catch-up should read the already loaded log suffix from memory;
 synchronous disk reads can block leader replication, while asynchronous paging
 complicates the runtime for little gain.
 
+## Observability
+
+`sukari` should expose detailed storage statistics without depending on a
+metrics backend or async runtime. The storage crate should own cheap typed
+handles for storage-specific counters and gauges, but it should not expose a
+generic metric-entry or backend-specific API.
+
+The first metrics design should cover:
+
+- segment records written and replayed
+- bytes written and replayed
+- segment rotations
+- flushes and durable syncs
+- replay truncations and checksum failures
+- node creation, node removal, and rejected operations for unknown nodes
+- snapshot checkpoints and whole-segment garbage collection
+
+Update paths should use pre-created metric handles so normal storage operations
+do not allocate strings or perform map lookups. `StorageEngine::stats()` returns
+a typed runtime snapshot of storage counters and gauges. Runtime integration
+crates can aggregate that snapshot with transport metrics, add deployment
+labels, and convert the result to Prometheus text or another scrape format.
+
+Metric names and labels belong at the runtime integration boundary. If exported
+there, names should use a stable `sukari_` prefix and labels should stay
+low-cardinality. Good dimensions include operation kind, record kind, sync
+policy, and error kind. Segment IDs, log indexes, request IDs, and stream IDs
+should not be labels.
+
+A small shared stats crate may become useful if `sukari`, transport, and runtime
+crates start duplicating the same atomic counter, gauge, and metric-entry types.
+That crate should stay optional until the duplicated API shape is clear.
+
 ## Compaction And Garbage Collection
 
 Garbage collection is the main complexity of shared storage.

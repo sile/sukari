@@ -154,6 +154,14 @@ impl NodeRegistry {
     pub(crate) fn active_node_ids(&self) -> BTreeSet<noraft::NodeId> {
         self.nodes().map(|(node_id, _)| node_id).collect()
     }
+
+    pub(crate) fn active_node_count(&self) -> usize {
+        self.nodes.values().filter(|entry| !entry.removed).count()
+    }
+
+    pub(crate) fn removed_node_count(&self) -> usize {
+        self.nodes.values().filter(|entry| entry.removed).count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

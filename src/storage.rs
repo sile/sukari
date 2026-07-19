@@ -2,6 +2,9 @@
 
 use crate::bytes::Bytes;
 use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_removed_error};
+use crate::stats::{
+    NodeAccessErrorKind, RecordKindMetric, StorageOperationKind, StorageStats, StorageStatsCounters,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -55,6 +58,7 @@ pub enum SyncPolicy {
 pub struct StorageEngine {
     dir: PathBuf,
     sync: SyncPolicy,
+    stats: StorageStatsCounters,
     registry: NodeRegistry,
     checkpoint_index: CheckpointIndex,
     writer: SegmentWriter,
@@ -82,13 +86,15 @@ impl StorageEngine {
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir, sync)?;
         let active_segment = select_active_append_segment(&dir)?;
-        recover_storage_dir(&dir, active_segment)?;
+        let stats = StorageStatsCounters::default();
+        recover_storage_dir(&dir, active_segment, &stats)?;
         let registry = NodeRegistry::load(&dir)?;
         let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
         let writer = SegmentWriter::open(&dir, sync, active_segment, max_segment_len)?;
         Ok(Self {
             dir,
             sync,
+            stats,
             registry,
             checkpoint_index,
             writer,
@@ -103,11 +109,13 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let mut registry = self.registry.clone();
         registry.create_node(node_id, metadata)?;
-        let append = self
-            .writer
-            .append(node_id, &Record::SnapshotCheckpoint(initial_checkpoint()))?;
+        let append = self.writer.append(
+            node_id,
+            &Record::SnapshotCheckpoint(initial_checkpoint()),
+            &self.stats,
+        )?;
         if should_sync_metadata(self.sync) {
-            self.writer.flush()?;
+            self.writer.flush(&self.stats)?;
         }
 
         let mut checkpoint_index = self.checkpoint_index.clone();
@@ -116,6 +124,7 @@ impl StorageEngine {
         registry.save(&self.dir, self.sync)?;
         self.registry = registry;
         self.checkpoint_index = checkpoint_index;
+        self.stats.node_created();
         Ok(())
     }
 
@@ -136,12 +145,13 @@ impl StorageEngine {
 
     /// Loads the current state for the given Raft node.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<NodeState> {
-        self.ensure_node_exists(node_id)?;
+        self.ensure_node_exists(node_id, StorageOperationKind::Load)?;
         replay_node_state(
             &self.dir,
             self.writer.active_segment,
             node_id,
             self.checkpoint_index.checkpoint_position(node_id),
+            &self.stats,
         )
     }
 
@@ -158,6 +168,7 @@ impl StorageEngine {
             self.writer.active_segment,
             Some(&active_node_ids),
             checkpoint_hints,
+            &self.stats,
         )?;
         let mut nodes = BTreeMap::new();
         for node_id in active_node_ids {
@@ -172,7 +183,11 @@ impl StorageEngine {
         node_id: noraft::NodeId,
         term: noraft::Term,
     ) -> io::Result<()> {
-        self.save_record(node_id, Record::CurrentTerm(term))
+        self.save_record(
+            node_id,
+            Record::CurrentTerm(term),
+            StorageOperationKind::SaveCurrentTerm,
+        )
     }
 
     /// Saves the node voted for in the current term.
@@ -181,12 +196,20 @@ impl StorageEngine {
         node_id: noraft::NodeId,
         voted_for: Option<noraft::NodeId>,
     ) -> io::Result<()> {
-        self.save_record(node_id, Record::VotedFor(voted_for))
+        self.save_record(
+            node_id,
+            Record::VotedFor(voted_for),
+            StorageOperationKind::SaveVotedFor,
+        )
     }
 
     /// Appends log entries and their command payloads.
     pub fn append_entries(&mut self, node_id: noraft::NodeId, append: LogAppend) -> io::Result<()> {
-        self.save_record(node_id, Record::Append(append))
+        self.save_record(
+            node_id,
+            Record::Append(append),
+            StorageOperationKind::AppendEntries,
+        )
     }
 
     /// Saves a snapshot checkpoint.
@@ -198,13 +221,15 @@ impl StorageEngine {
         node_id: noraft::NodeId,
         checkpoint: SnapshotCheckpoint,
     ) -> io::Result<()> {
-        self.ensure_node_exists(node_id)?;
+        self.ensure_node_exists(node_id, StorageOperationKind::SaveSnapshot)?;
         checkpoint.validate()?;
-        let append = self
-            .writer
-            .append(node_id, &Record::SnapshotCheckpoint(checkpoint))?;
+        let append = self.writer.append(
+            node_id,
+            &Record::SnapshotCheckpoint(checkpoint),
+            &self.stats,
+        )?;
         if should_sync_metadata(self.sync) {
-            self.writer.flush()?;
+            self.writer.flush(&self.stats)?;
         }
 
         let mut checkpoint_index = self.checkpoint_index.clone();
@@ -212,11 +237,13 @@ impl StorageEngine {
         checkpoint_index.save(&self.dir, self.sync)?;
         self.checkpoint_index = checkpoint_index;
         self.collect_garbage()?;
+        self.stats.snapshot_checkpoint_saved();
         Ok(())
     }
 
     /// Marks the given Raft node as removed and reserves its node ID.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
+        self.ensure_node_exists(node_id, StorageOperationKind::RemoveNode)?;
         let mut registry = self.registry.clone();
         registry.remove_node(node_id)?;
         registry.save(&self.dir, self.sync)?;
@@ -227,12 +254,15 @@ impl StorageEngine {
         checkpoint_index.save(&self.dir, self.sync)?;
         self.checkpoint_index = checkpoint_index;
         self.collect_garbage()?;
+        self.stats.node_removed();
         Ok(())
     }
 
     /// Flushes pending writes.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer.flush(&self.stats)?;
+        self.stats.flushed();
+        Ok(())
     }
 
     /// Removes all storage data managed by this engine.
@@ -251,29 +281,56 @@ impl StorageEngine {
         self.sync
     }
 
-    fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
-        self.ensure_node_exists(node_id)?;
-        self.writer.append(node_id, &record)?;
+    /// Returns a snapshot of storage statistics since this engine was opened.
+    pub fn stats(&self) -> StorageStats {
+        let mut stats = self.stats.snapshot();
+        stats.active_nodes = usize_to_u64(self.registry.active_node_count());
+        stats.removed_nodes = usize_to_u64(self.registry.removed_node_count());
+        stats.checkpoint_index_nodes = usize_to_u64(self.checkpoint_index.len());
+        stats.active_append_segment_id = self.writer.active_segment.id.get();
+        stats.active_append_segment_len_bytes = self.writer.segment_len;
+        stats.unsynced_records = usize_to_u64(self.writer.unsynced_records);
+        stats.unsynced_bytes = self.writer.unsynced_bytes;
+        stats
+    }
+
+    fn save_record(
+        &mut self,
+        node_id: noraft::NodeId,
+        record: Record,
+        operation: StorageOperationKind,
+    ) -> io::Result<()> {
+        self.ensure_node_exists(node_id, operation)?;
+        self.writer.append(node_id, &record, &self.stats)?;
         Ok(())
     }
 
-    fn ensure_node_exists(&self, node_id: noraft::NodeId) -> io::Result<()> {
+    fn ensure_node_exists(
+        &self,
+        node_id: noraft::NodeId,
+        operation: StorageOperationKind,
+    ) -> io::Result<()> {
         if self.registry.is_active(node_id) {
             return Ok(());
         }
         if self.registry.is_removed(node_id) {
+            self.stats
+                .rejected_operation(operation, NodeAccessErrorKind::RemovedNode);
             return Err(node_removed_error());
         }
+        self.stats
+            .rejected_operation(operation, NodeAccessErrorKind::UnknownNode);
         Err(node_not_found_error())
     }
 
     fn collect_garbage(&self) -> io::Result<()> {
+        self.stats.gc_ran();
         let active_node_ids = self.registry.active_node_ids();
         let Some(barrier) = self.checkpoint_index.gc_barrier(&active_node_ids) else {
             return Ok(());
         };
 
-        let mut deleted = false;
+        let mut deleted_segments = 0;
         for segment in discover_segment_paths(&self.dir)? {
             if segment.name.kind != SegmentKind::Append {
                 continue;
@@ -286,13 +343,16 @@ impl StorageEngine {
             }
 
             match std::fs::remove_file(&segment.path) {
-                Ok(()) => deleted = true,
+                Ok(()) => deleted_segments += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
 
-        if deleted && should_sync_metadata(self.sync) {
+        if deleted_segments != 0 {
+            self.stats.gc_deleted_segments(deleted_segments);
+        }
+        if deleted_segments != 0 && should_sync_metadata(self.sync) {
             sync_dir(&self.dir)?;
         }
         Ok(())
@@ -339,13 +399,18 @@ impl SegmentWriter {
         })
     }
 
-    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<RecordPosition> {
+    fn append(
+        &mut self,
+        node_id: noraft::NodeId,
+        record: &Record,
+        stats: &StorageStatsCounters,
+    ) -> io::Result<RecordPosition> {
         debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
         if self.should_rotate(written_bytes) {
-            self.rotate()?;
+            self.rotate(stats)?;
         }
         let record_position = RecordPosition {
             segment: self.active_segment,
@@ -356,7 +421,8 @@ impl SegmentWriter {
             .segment_len
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
-        self.after_write(written_bytes)?;
+        stats.record_written(record.metric_kind(), written_bytes);
+        self.after_write(written_bytes, stats)?;
         Ok(record_position)
     }
 
@@ -369,8 +435,8 @@ impl SegmentWriter {
             .is_none_or(|len| self.max_segment_len < len)
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
-        self.flush()?;
+    fn rotate(&mut self, stats: &StorageStatsCounters) -> io::Result<()> {
+        self.flush(stats)?;
         let next_segment = self.active_segment.next_append()?;
         let segment_path = next_segment.path(&self.dir);
         let file = create_active_segment_file(&segment_path)?;
@@ -384,12 +450,13 @@ impl SegmentWriter {
         self.segment_len = 0;
         self.unsynced_records = 0;
         self.unsynced_bytes = 0;
+        stats.segment_rotated();
         Ok(())
     }
 
-    fn after_write(&mut self, written_bytes: u64) -> io::Result<()> {
+    fn after_write(&mut self, written_bytes: u64, stats: &StorageStatsCounters) -> io::Result<()> {
         match self.sync {
-            SyncPolicy::Strict => self.sync_data(),
+            SyncPolicy::Strict => self.sync_data(stats),
             SyncPolicy::Batch {
                 max_records,
                 max_bytes,
@@ -399,7 +466,7 @@ impl SegmentWriter {
                 let records_reached = max_records != 0 && max_records <= self.unsynced_records;
                 let bytes_reached = max_bytes != 0 && max_bytes <= self.unsynced_bytes;
                 if records_reached || bytes_reached {
-                    self.sync_data()?;
+                    self.sync_data(stats)?;
                 }
                 Ok(())
             }
@@ -407,18 +474,20 @@ impl SegmentWriter {
         }
     }
 
-    fn sync_data(&mut self) -> io::Result<()> {
+    fn sync_data(&mut self, stats: &StorageStatsCounters) -> io::Result<()> {
         self.file.sync_data()?;
         self.unsynced_records = 0;
         self.unsynced_bytes = 0;
+        stats.durable_synced();
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self, stats: &StorageStatsCounters) -> io::Result<()> {
         match self.sync {
-            SyncPolicy::UnsafeNoSync => Ok(()),
-            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(),
+            SyncPolicy::UnsafeNoSync => {}
+            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(stats)?,
         }
+        Ok(())
     }
 }
 
@@ -649,6 +718,17 @@ enum Record {
     VotedFor(Option<noraft::NodeId>),
     Append(LogAppend),
     SnapshotCheckpoint(SnapshotCheckpoint),
+}
+
+impl Record {
+    fn metric_kind(&self) -> RecordKindMetric {
+        match self {
+            Self::CurrentTerm(_) => RecordKindMetric::CurrentTerm,
+            Self::VotedFor(_) => RecordKindMetric::VotedFor,
+            Self::Append(_) => RecordKindMetric::LogAppend,
+            Self::SnapshotCheckpoint(_) => RecordKindMetric::SnapshotCheckpoint,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -998,6 +1078,10 @@ impl CheckpointIndex {
         self.nodes.remove(&node_id);
     }
 
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn validate_checkpoint_positions(&self, dir: &Path) -> io::Result<()> {
         for (node_id, state) in &self.nodes {
             validate_checkpoint_position(dir, *node_id, state.checkpoint_position)?;
@@ -1132,7 +1216,7 @@ fn validate_checkpoint_position(
         ));
     }
     file.seek(SeekFrom::Start(position.offset))?;
-    let body = read_record_body(&mut file)?
+    let body = read_record_body(&mut file, None)?
         .ok_or_else(|| invalid_data("checkpoint index offset does not point to a record"))?;
     let node_record = decode_node_record(&body)?;
     if node_record.node_id != node_id {
@@ -1182,11 +1266,17 @@ fn replay_node_state(
     active_segment: SegmentName,
     node_id: noraft::NodeId,
     checkpoint_hint: Option<RecordPosition>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<NodeState> {
     let mut target_nodes = BTreeSet::new();
     target_nodes.insert(node_id);
-    let checkpoint_positions =
-        find_checkpoint_positions_from(dir, active_segment, Some(&target_nodes), checkpoint_hint)?;
+    let checkpoint_positions = find_checkpoint_positions_from(
+        dir,
+        active_segment,
+        Some(&target_nodes),
+        checkpoint_hint,
+        stats,
+    )?;
     let checkpoint_position = checkpoint_positions.get(&node_id).copied();
 
     let mut state = NodeState::default();
@@ -1201,6 +1291,7 @@ fn replay_node_state(
             node_id,
             checkpoint_position,
             &mut state,
+            stats,
         )?;
     }
     Ok(state)
@@ -1211,9 +1302,10 @@ fn replay_storage_dir(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<ReplayState> {
     let (checkpoint_positions, replay_start_segment) =
-        checkpoint_positions_for_replay(dir, active_segment, node_filter, checkpoint_hints)?;
+        checkpoint_positions_for_replay(dir, active_segment, node_filter, checkpoint_hints, stats)?;
     let mut replay = ReplayState::default();
     for segment in discover_segment_paths(dir)? {
         if replay_start_segment.is_some_and(|start| segment.name < start) {
@@ -1226,6 +1318,7 @@ fn replay_storage_dir(
             node_filter,
             &checkpoint_positions,
             &mut replay,
+            stats,
         )?;
     }
     Ok(replay)
@@ -1236,28 +1329,38 @@ fn checkpoint_positions_for_replay(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<(
     BTreeMap<noraft::NodeId, RecordPosition>,
     Option<SegmentName>,
 )> {
     let Some(mut checkpoint_positions) = checkpoint_hints else {
-        return find_checkpoint_positions(dir, active_segment, node_filter)
+        return find_checkpoint_positions(dir, active_segment, node_filter, stats)
             .map(|positions| (positions, None));
     };
 
     let Some(start_position) = checkpoint_positions.values().copied().min() else {
         return Ok((checkpoint_positions, None));
     };
-    let discovered =
-        find_checkpoint_positions_from(dir, active_segment, node_filter, Some(start_position))?;
+    let discovered = find_checkpoint_positions_from(
+        dir,
+        active_segment,
+        node_filter,
+        Some(start_position),
+        stats,
+    )?;
     checkpoint_positions.extend(discovered);
     Ok((checkpoint_positions, Some(start_position.segment)))
 }
 
-fn recover_storage_dir(dir: &Path, active_segment: SegmentName) -> io::Result<()> {
+fn recover_storage_dir(
+    dir: &Path,
+    active_segment: SegmentName,
+    stats: &StorageStatsCounters,
+) -> io::Result<()> {
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        scan_segment(&segment.path, allow_partial)?;
+        scan_segment(&segment.path, allow_partial, stats)?;
     }
     Ok(())
 }
@@ -1291,8 +1394,9 @@ fn find_checkpoint_positions(
     dir: &Path,
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
-    find_checkpoint_positions_from(dir, active_segment, node_filter, None)
+    find_checkpoint_positions_from(dir, active_segment, node_filter, None, stats)
 }
 
 fn find_checkpoint_positions_from(
@@ -1300,6 +1404,7 @@ fn find_checkpoint_positions_from(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     start_position: Option<RecordPosition>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
     let mut checkpoints = BTreeMap::new();
     for segment in discover_segment_paths(dir)? {
@@ -1316,6 +1421,7 @@ fn find_checkpoint_positions_from(
             node_filter,
             start_offset,
             &mut checkpoints,
+            stats,
         )?;
     }
     Ok(checkpoints)
@@ -1327,6 +1433,7 @@ fn scan_checkpoint_positions(
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     start_offset: Option<u64>,
     checkpoints: &mut BTreeMap<noraft::NodeId, RecordPosition>,
+    stats: &StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1343,11 +1450,12 @@ fn scan_checkpoint_positions(
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file)? else {
+        let Some(body) = read_record_body(&mut file, Some(stats))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
+                stats.replay_truncated();
                 file.set_len(record_start)?;
                 file.seek(SeekFrom::Start(record_start))?;
                 break;
@@ -1379,6 +1487,7 @@ fn replay_segment(
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_positions: &BTreeMap<noraft::NodeId, RecordPosition>,
     replay: &mut ReplayState,
+    stats: &StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1389,11 +1498,12 @@ fn replay_segment(
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file)? else {
+        let Some(body) = read_record_body(&mut file, Some(stats))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
+                stats.replay_truncated();
                 file.set_len(record_start)?;
                 file.seek(SeekFrom::Start(record_start))?;
                 break;
@@ -1412,7 +1522,10 @@ fn replay_segment(
             {
                 continue;
             }
-            replay.apply(decode_node_record(&body)?)?;
+            let node_record = decode_node_record(&body)?;
+            let record_kind = node_record.record.metric_kind();
+            replay.apply(node_record)?;
+            stats.record_replayed(record_kind, frame_len_from_body(&body)?);
         }
     }
 
@@ -1425,6 +1538,7 @@ fn replay_node_segment(
     target_node_id: noraft::NodeId,
     checkpoint_position: Option<RecordPosition>,
     state: &mut NodeState,
+    stats: &StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1435,11 +1549,12 @@ fn replay_node_segment(
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file)? else {
+        let Some(body) = read_record_body(&mut file, Some(stats))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
+                stats.replay_truncated();
                 file.set_len(record_start)?;
                 file.seek(SeekFrom::Start(record_start))?;
                 break;
@@ -1455,14 +1570,17 @@ fn replay_node_segment(
             if checkpoint_position.is_some_and(|checkpoint| record_position < checkpoint) {
                 continue;
             }
-            apply_record_to_state(state, decode_node_record(&body)?.record)?;
+            let node_record = decode_node_record(&body)?;
+            let record_kind = node_record.record.metric_kind();
+            apply_record_to_state(state, node_record.record)?;
+            stats.record_replayed(record_kind, frame_len_from_body(&body)?);
         }
     }
 
     Ok(())
 }
 
-fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
+fn scan_segment(path: &Path, allow_partial: bool, stats: &StorageStatsCounters) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
@@ -1472,7 +1590,7 @@ fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
 
     loop {
         let record_start = file.stream_position()?;
-        if scan_record_frame(&mut file)?.is_some() {
+        if scan_record_frame(&mut file, stats)?.is_some() {
             continue;
         }
 
@@ -1480,6 +1598,7 @@ fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
             break;
         }
         if allow_partial {
+            stats.replay_truncated();
             file.set_len(record_start)?;
             file.seek(SeekFrom::Start(record_start))?;
             break;
@@ -1490,7 +1609,7 @@ fn scan_segment(path: &Path, allow_partial: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn scan_record_frame(file: &mut File) -> io::Result<Option<()>> {
+fn scan_record_frame(file: &mut File, stats: &StorageStatsCounters) -> io::Result<Option<()>> {
     let mut header = [0; SEGMENT_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
         Ok(()) => {}
@@ -1535,6 +1654,7 @@ fn scan_record_frame(file: &mut File) -> io::Result<Option<()>> {
     }
 
     if crc32c_finish(crc) != expected_checksum {
+        stats.checksum_failed();
         return Err(invalid_data("segment record checksum mismatch"));
     }
 
@@ -1604,7 +1724,10 @@ fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<V
     Ok(frame)
 }
 
-fn read_record_body(file: &mut File) -> io::Result<Option<Vec<u8>>> {
+fn read_record_body(
+    file: &mut File,
+    stats: Option<&StorageStatsCounters>,
+) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0; SEGMENT_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
         Ok(()) => {}
@@ -1642,9 +1765,17 @@ fn read_record_body(file: &mut File) -> io::Result<Option<Vec<u8>>> {
 
     let actual_checksum = crc32c(&body);
     if actual_checksum != expected_checksum {
+        if let Some(stats) = stats {
+            stats.checksum_failed();
+        }
         return Err(invalid_data("segment record checksum mismatch"));
     }
     Ok(Some(body))
+}
+
+fn frame_len_from_body(body: &[u8]) -> io::Result<u64> {
+    u64::try_from(SEGMENT_HEADER_LEN + body.len())
+        .map_err(|_| invalid_data("segment frame length overflow"))
 }
 
 fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
@@ -2044,6 +2175,10 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 fn invalid_json(error: nojson::JsonParseError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("usize value should fit in u64")
 }
 
 fn remove_storage_dir_if_exists(path: &Path, sync: SyncPolicy) -> io::Result<()> {

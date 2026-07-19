@@ -9,3 +9,8 @@
 ## Segment Format
 
 - Document the `SKR1` format once the first release boundary is clear.
+
+## Observability
+
+- Decide whether runtime integration crates need a shared metric export helper
+  outside this crate.
