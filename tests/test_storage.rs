@@ -1,7 +1,4 @@
-use sukari::{
-    bytes::Bytes,
-    storage::{LogAppend, Snapshot, StorageEngine, StorageState, SyncPolicy},
-};
+use sukari::{Bytes, LogAppend, Snapshot, StorageEngine, StorageState, SyncPolicy};
 
 use std::{
     collections::BTreeMap,

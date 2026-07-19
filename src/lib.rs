@@ -4,5 +4,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bytes;
-pub mod storage;
+mod bytes;
+mod storage;
+
+pub use bytes::Bytes;
+pub use storage::{LogAppend, Snapshot, StorageEngine, StorageState, SyncPolicy};
