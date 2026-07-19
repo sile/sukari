@@ -15,6 +15,10 @@ const NODE_REGISTRY_TMP_FILE_NAME: &str = "nodes.json.tmp";
 const NODE_REGISTRY_VERSION: u64 = 1;
 
 /// Application-defined metadata for a Raft node.
+///
+/// The `startup` flag is interpreted by `sukari` for startup discovery.
+/// The JSON metadata is stored and returned without application-specific
+/// interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeMetadata {
     startup: bool,
@@ -27,7 +31,7 @@ impl NodeMetadata {
         Self { startup, metadata }
     }
 
-    /// Returns whether this node should be considered during process startup.
+    /// Returns whether this node is marked for process startup.
     pub fn startup(&self) -> bool {
         self.startup
     }

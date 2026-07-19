@@ -30,10 +30,10 @@ const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
 
-/// Storage synchronization policy.
+/// Storage synchronization policy for segment data and metadata files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
-    /// Synchronize durable data after every storage record.
+    /// Synchronize durable data after every storage record and metadata update.
     Strict,
 
     /// Synchronize durable data after record or byte thresholds are reached.
@@ -48,11 +48,23 @@ pub enum SyncPolicy {
         max_bytes: u64,
     },
 
-    /// Never synchronize durable data explicitly.
+    /// Never synchronize durable data or metadata explicitly.
+    ///
+    /// This policy leaves persistence timing to the operating system.
     UnsafeNoSync,
 }
 
-/// Shared segmented storage engine.
+/// Shared segmented storage engine for registered Raft nodes.
+///
+/// The engine appends storage records for many nodes into shared append
+/// segments. Node IDs must be registered with [`StorageEngine::create_node`]
+/// before node state records can be written or loaded. Removed node IDs remain
+/// reserved.
+///
+/// The engine validates record-local invariants before writing, such as command
+/// payload mappings in [`LogAppend`]. It does not validate a log append against
+/// the node's currently loaded log before writing. Replay applies records in
+/// append order and resolves divergent log suffixes.
 #[derive(Debug)]
 pub struct StorageEngine {
     dir: PathBuf,
@@ -64,12 +76,16 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    /// Makes a new shared storage engine.
+    /// Opens or creates a storage engine in `dir`.
+    ///
+    /// Opening a storage directory recovers the active segment, loads the node
+    /// registry and checkpoint index, and prepares the active append segment for
+    /// new writes.
     pub fn new<P: AsRef<Path>>(dir: P, sync: SyncPolicy) -> io::Result<Self> {
         Self::with_max_segment_len(dir, sync, DEFAULT_MAX_SEGMENT_LEN)
     }
 
-    /// Makes a new shared storage engine with a maximum append segment length.
+    /// Opens or creates a storage engine with a maximum append segment length.
     ///
     /// If a single record is larger than `max_segment_len`, it is written to an
     /// empty segment and that segment is allowed to exceed the limit.
@@ -101,6 +117,10 @@ impl StorageEngine {
     }
 
     /// Creates a Raft node in this storage instance.
+    ///
+    /// This also writes an initial empty snapshot checkpoint so the node has a
+    /// garbage-collection barrier from creation. A node ID cannot be created
+    /// again after it has been created, even if it is later removed.
     pub fn create_node(
         &mut self,
         node_id: noraft::NodeId,
@@ -137,12 +157,16 @@ impl StorageEngine {
         self.registry.nodes()
     }
 
-    /// Returns active Raft nodes that should be considered during process startup.
+    /// Returns active Raft nodes marked for process startup.
     pub fn startup_nodes(&self) -> impl Iterator<Item = (noraft::NodeId, &NodeMetadata)> + '_ {
         self.registry.startup_nodes()
     }
 
     /// Loads the current state for the given Raft node.
+    ///
+    /// The state is built on demand by replaying segment records. When a valid
+    /// checkpoint hint exists, replay starts at that checkpoint record instead
+    /// of scanning from the first segment.
     pub fn load(&self, node_id: noraft::NodeId) -> io::Result<NodeState> {
         self.ensure_node_exists(node_id, StorageOperationKind::Load)?;
         replay_node_state(
@@ -155,6 +179,10 @@ impl StorageEngine {
     }
 
     /// Loads the latest state of all non-removed nodes.
+    ///
+    /// If every active node has a checkpoint hint, replay starts from the
+    /// oldest hinted checkpoint segment. If any active node lacks a hint, replay
+    /// scans all append segments.
     pub fn load_all(&self) -> io::Result<BTreeMap<noraft::NodeId, NodeState>> {
         let active_node_ids = self.registry.active_node_ids();
         if active_node_ids.is_empty() {
@@ -203,6 +231,9 @@ impl StorageEngine {
     }
 
     /// Appends log entries and their command payloads.
+    ///
+    /// The append is recorded as received. The storage layer checks only that
+    /// command entries and command payloads match each other.
     pub fn append_entries(&mut self, node_id: noraft::NodeId, append: LogAppend) -> io::Result<()> {
         self.save_record(
             node_id,
@@ -213,8 +244,11 @@ impl StorageEngine {
 
     /// Saves a snapshot checkpoint.
     ///
-    /// The checkpoint suffix must start at the snapshot's last included
-    /// position.
+    /// A checkpoint is a complete recovery point for one node. It stores the
+    /// current term, voted-for node, latest snapshot, and retained log suffix.
+    /// Earlier records for the node become obsolete for replay and whole-segment
+    /// garbage collection. The checkpoint suffix must start at the snapshot's
+    /// last included position.
     pub fn save_snapshot(
         &mut self,
         node_id: noraft::NodeId,
@@ -241,6 +275,9 @@ impl StorageEngine {
     }
 
     /// Marks the given Raft node as removed and reserves its node ID.
+    ///
+    /// Removal is persisted in the node registry. No segment record is appended
+    /// for node removal.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
         self.ensure_node_exists(node_id, StorageOperationKind::RemoveNode)?;
         let mut registry = self.registry.clone();
@@ -257,7 +294,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flushes pending writes.
+    /// Flushes pending segment writes according to the synchronization policy.
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush(&self.stats)?;
         self.stats.flushed();
@@ -265,6 +302,8 @@ impl StorageEngine {
     }
 
     /// Removes all storage data managed by this engine.
+    ///
+    /// This consumes the engine and deletes the storage directory.
     pub fn remove_all(self) -> io::Result<()> {
         drop(self.writer);
         remove_storage_dir_if_exists(&self.dir, self.sync)
@@ -490,7 +529,12 @@ impl SegmentWriter {
     }
 }
 
-/// A log append operation.
+/// A persisted log append operation.
+///
+/// The value pairs `noraft` log entries with opaque command payload bytes.
+/// Construction validates only the record-local payload mapping: every command
+/// entry must have one payload, and payloads must not exist for non-command
+/// entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogAppend {
     /// Log entries emitted by `noraft`.
@@ -541,6 +585,9 @@ impl LogAppend {
 }
 
 /// Snapshot data saved by the storage backend.
+///
+/// Snapshot payload bytes are application-defined and are loaded into memory
+/// with the rest of the node state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Last log position included in the snapshot.
@@ -554,6 +601,10 @@ pub struct Snapshot {
 }
 
 /// Snapshot checkpoint data saved by the storage backend.
+///
+/// A checkpoint replaces the earlier replay history for one node. Callers that
+/// need log entries after the snapshot position must include them in
+/// [`SnapshotCheckpoint::suffix`] or append them after saving the checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotCheckpoint {
     /// Current term at the checkpoint.
@@ -611,6 +662,10 @@ fn initial_checkpoint() -> SnapshotCheckpoint {
 }
 
 /// Loaded persistent state for a Raft node.
+///
+/// `StorageEngine` does not keep this full state in memory for normal writes.
+/// It is constructed by [`StorageEngine::load`] or [`StorageEngine::load_all`]
+/// when callers need to rebuild a Raft node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeState {
     /// Current term.

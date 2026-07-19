@@ -1,13 +1,12 @@
 # Architecture Overview
 
-This document records the current design direction of `sukari`.
-Update it as the implementation changes.
+This document describes the current storage architecture of `sukari`.
 
 ## Scope
 
 `sukari` is a shared segmented storage engine for Raft state.
 
-The crate should own:
+The crate owns:
 
 - shared segment file format
 - advisory manifest format
@@ -18,17 +17,16 @@ The crate should own:
 - automatic whole-segment garbage collection
 - node registry metadata for storage namespace ownership
 - storage metrics
-- migration tools from per-node WAL if needed
 
-The crate should not own Raft protocol logic, networking, runtime tasks, timers,
+The crate does not own Raft protocol logic, networking, runtime tasks, timers,
 or application command execution. Those responsibilities belong to `noraft` or
 higher-level runtime and adapter crates.
 
 ## Crate Boundary
 
 `sukari` exists as a separate crate because shared segmented storage has complex
-failure modes and garbage collection rules. The API should stay compatible with
-the storage operations commonly emitted by `noraft`-based runtimes:
+failure modes and garbage collection rules. The API follows the storage
+operations commonly emitted by `noraft`-based runtimes:
 
 - save current term
 - save voted-for node
@@ -38,16 +36,16 @@ the storage operations commonly emitted by `noraft`-based runtimes:
 - mark a node removed and reserve its node ID
 
 The standard architecture treats `noraft::NodeId` values as globally unique.
-`sukari` should therefore route records by node ID. A small node registry may
-belong in this crate so the storage layer can define which node IDs exist in a
-storage instance and so a process can discover startup nodes before loading an
-external control plane. Cluster membership, group placement, and orchestration
-state should stay in the control plane above the storage layer.
+`sukari` routes records by node ID. The node registry belongs in this crate so
+the storage layer can define which node IDs exist in a storage instance and so a
+process can discover startup nodes before loading an external control plane.
+Cluster membership, group placement, and orchestration state stay in the control
+plane above the storage layer.
 
 ## Current Baseline
 
-The current implementation provides a conservative append-only baseline with
-one active shared append segment at a time:
+The implementation provides a conservative append-only baseline with one active
+shared append segment at a time:
 
 ```text
 storage/
@@ -89,22 +87,23 @@ created with `create_node()`. Removed node IDs are permanently reserved and
 cannot be created again.
 
 `sukari` does not add internal mutexes around writes. Callers that need
-concurrent runtime integration should own serialization outside this crate, for
-example by routing storage requests through a dedicated storage task.
+concurrent runtime integration own serialization outside this crate, for example
+by routing storage requests through a dedicated storage task.
 
 Write operations append storage records as they are received. The storage layer
 validates record-local invariants, such as frame checksums and command payload
-mapping, but it should not check whether a log append anchor matches the
-currently loaded log before writing. Divergent log suffixes caused by leader
-changes are reconciled by deterministic replay, which applies records in their
-original append order.
+mapping, but it does not check whether a log append anchor matches the currently
+loaded log before writing. Divergent log suffixes caused by leader changes are
+reconciled by deterministic replay, which applies records in their original
+append order.
 
 The on-disk segment record format is specified in
 [segment-format.md](segment-format.md).
 
-## Future Layout
+## Storage Directory Layout
 
-The intended full design is a shared segmented append-only design:
+A populated storage directory uses shared append segments plus small JSON
+metadata files:
 
 ```text
 storage/
@@ -117,7 +116,7 @@ storage/
 
 ## Node Registry
 
-The current implementation stores a small JSON node registry file:
+The implementation stores a small JSON node registry file:
 
 ```text
 storage/
@@ -132,7 +131,7 @@ Storage operations such as `load()`, `save_current_term()`, `save_voted_for()`,
 `append_entries()`, and `save_snapshot()` fail for node IDs that have not been
 created.
 
-`nodes.json` currently has this schema:
+`nodes.json` has this schema:
 
 ```json
 {
@@ -158,11 +157,11 @@ zero-position snapshot with an empty payload, and an empty suffix. Its location
 is stored in `checkpoints.json`. This gives every normally created active node a
 checkpoint barrier without adding GC-specific fields to `nodes.json`.
 
-Each node entry should contain a typed `startup` flag and opaque JSON metadata.
-The `startup` flag means the node should be considered during process startup
-before any external control plane has been loaded. The metadata JSON is
-application-defined. `sukari` validates it with the `nojson` crate and writes the
-raw JSON value without interpreting it.
+Each node entry contains a typed `startup` flag and opaque JSON metadata. The
+`startup` flag means the node is considered during process startup before any
+external control plane has been loaded. The metadata JSON is application-defined.
+`sukari` validates it with the `nojson` crate and writes the raw JSON value
+without interpreting it.
 
 `nodes.json` contains all node entries in one small file and is updated by
 atomic replacement. The update protocol writes `nodes.json.tmp`, syncs it,
@@ -182,7 +181,7 @@ state; those belong to the control plane above `sukari`.
 
 ## Manifest
 
-The current implementation stores a small advisory JSON manifest file:
+The implementation stores a small advisory JSON manifest file:
 
 ```json
 {
@@ -206,10 +205,9 @@ still discover segment files and must not depend only on the manifest.
 
 ## Snapshot Checkpoints
 
-The current implementation provides a snapshot checkpoint operation. A
-checkpoint is stronger than saving a snapshot alone: it records a complete
-recovery point for one node and declares that earlier records for that node are
-no longer needed.
+The implementation provides a snapshot checkpoint operation. A checkpoint is
+stronger than saving a snapshot alone: it records a complete recovery point for
+one node and declares that earlier records for that node are no longer needed.
 
 The API shape is:
 
@@ -228,18 +226,19 @@ pub fn save_snapshot(
 ) -> io::Result<()>;
 ```
 
-The checkpoint record should contain the current term, voted-for node,
-snapshot, and retained log suffix after the snapshot. If a caller still needs
-log entries after the snapshot position, it must include them in the checkpoint
-suffix or append them again after the checkpoint has been saved. Replay may
-ignore older records for the same node once it sees a valid checkpoint. The
-checkpoint suffix should start at the snapshot's last included position.
+The checkpoint record contains the current term, voted-for node, snapshot, and
+retained log suffix after the snapshot. If a caller still needs log entries
+after the snapshot position, it must include them in the checkpoint suffix or
+append them again after the checkpoint has been saved. Replay may ignore older
+records for the same node once it sees a valid checkpoint. The checkpoint suffix
+must start at the snapshot's last included position.
 
 `save_snapshot()` also updates `checkpoints.json` with the segment name and
 record offset of the checkpoint record. When the sync policy requires durable
 metadata, the checkpoint record is flushed before `checkpoints.json` is
-replaced. This ordering can leave the index stale after a crash, but it should
-not point at a checkpoint record that was never made durable.
+replaced. This ordering can leave the index stale after a crash. Under durable
+sync policies, it prevents the index from pointing at a checkpoint record that
+was never made durable.
 
 `create_node()` uses the same ordering for its initial checkpoint. If a crash
 happens after the checkpoint index update but before the node registry update,
@@ -257,30 +256,30 @@ file-name order, and rebuilds per-node state:
 - command payloads
 - latest snapshot metadata and data or reference
 
-The first version should not require an on-disk random-read log index. Normal
-reads are expected to be rare and mostly limited to startup. `checkpoints.json`
-is only a checkpoint index: `load(node_id)` can use it as a hint to skip
-segments before the latest known checkpoint, and `load_all()` can use it when
-every active node has a checkpoint hint. In that case, `load_all()` starts from
-the oldest hinted checkpoint segment and still scans forward for newer
-checkpoints. If any active node has no checkpoint hint, `load_all()` falls back
-to the full replay path because that node may need records before its first
-checkpoint. The checkpoint index is not a general random-read index for log
-paging. If the index is stale, replay scans from the hinted checkpoint record
-forward and can still discover a newer checkpoint.
+The implementation does not require an on-disk random-read log index.
+Normal reads are expected to be rare and mostly limited to startup.
+`checkpoints.json` is only a checkpoint index: `load(node_id)` can use it as a
+hint to skip segments before the latest known checkpoint, and `load_all()` can
+use it when every active node has a checkpoint hint. In that case, `load_all()`
+starts from the oldest hinted checkpoint segment and still scans forward for
+newer checkpoints. If any active node has no checkpoint hint, `load_all()` falls
+back to the full replay path because that node may need records before its
+first checkpoint. The checkpoint index is not a general random-read index for
+log paging. If the index is stale, replay scans from the hinted checkpoint
+record forward and can still discover a newer checkpoint.
 
 The active segment tolerates a trailing partial record and truncates it during
 replay. Inactive segments do not tolerate trailing partial records because they
-should have been completed before a later active segment became visible.
-Checksum mismatches are treated as corruption.
+must have been completed before a later active segment became visible. Checksum
+mismatches are treated as corruption.
 
 ## Memory Model
 
-`StorageEngine` should not keep fully replayed node state in memory for normal
+`StorageEngine` does not keep fully replayed node state in memory for normal
 writes. Opening the engine may scan segment frames for recovery, but full
-`NodeState` construction should happen only when loading state. `load()`
-constructs the requested node state, while `load_all()` constructs all
-non-removed node states.
+`NodeState` construction happens only when loading state. `load()` constructs
+the requested node state, while `load_all()` constructs all non-removed node
+states.
 
 The initial design assumes that the loaded snapshot payload and the log entries
 after that snapshot fit comfortably in memory. Payload bytes are stored in a
@@ -289,18 +288,18 @@ payloads is cheap, but the bytes themselves are still expected to fit in memory.
 This keeps the storage API simple and matches the expected Raft usage. Very
 large snapshots and large blob payloads are poor fits for Raft and are not
 target use cases. Random-read log paging is also not a target use case.
-Lagging-node catch-up should read the already loaded log suffix from memory;
+Lagging-node catch-up reads the already loaded log suffix from memory;
 synchronous disk reads can block leader replication, while asynchronous paging
 complicates the runtime for little gain.
 
 ## Observability
 
-`sukari` should expose detailed storage statistics without depending on a
-metrics backend or async runtime. The storage crate should own cheap typed
-handles for storage-specific counters and gauges, but it should not expose a
-generic metric-entry or backend-specific API.
+`sukari` exposes detailed storage statistics without depending on a metrics
+backend or async runtime. The storage crate keeps cheap typed counters and
+gauges internally, but it does not expose a generic metric-entry or
+backend-specific API.
 
-The first metrics design should cover:
+The typed stats snapshot covers:
 
 - segment records written and replayed
 - bytes written and replayed
@@ -310,21 +309,16 @@ The first metrics design should cover:
 - node creation, node removal, and rejected operations for unknown nodes
 - snapshot checkpoints and whole-segment garbage collection
 
-Update paths should use pre-created metric handles so normal storage operations
-do not allocate strings or perform map lookups. `StorageEngine::stats()` returns
-a typed runtime snapshot of storage counters and gauges. Runtime integration
+Update paths use pre-created counters so normal storage operations do not
+allocate strings or perform map lookups. `StorageEngine::stats()` returns a
+typed runtime snapshot of storage counters and gauges. Runtime integration
 crates can aggregate that snapshot with transport metrics, add deployment
 labels, and convert the result to Prometheus text or another scrape format.
 
-Metric names and labels belong at the runtime integration boundary. If exported
-there, names should use a stable `sukari_` prefix and labels should stay
-low-cardinality. Good dimensions include operation kind, record kind, sync
-policy, and error kind. Segment IDs, log indexes, request IDs, and stream IDs
-should not be labels.
-
-A small shared stats crate may become useful if `sukari`, transport, and runtime
-crates start duplicating the same atomic counter, gauge, and metric-entry types.
-That crate should stay optional until the duplicated API shape is clear.
+Metric names and labels belong at the runtime integration boundary. Exported
+names use a stable `sukari_` prefix and labels stay low-cardinality. Good
+dimensions include operation kind, record kind, sync policy, and error kind.
+Segment IDs, log indexes, request IDs, and stream IDs are not labels.
 
 ## Compaction And Garbage Collection
 
@@ -335,9 +329,9 @@ deleted when all records in that segment are obsolete. Snapshot progress for one
 node is not sufficient by itself. Removed nodes are identified from `nodes.json`;
 the segment stream does not contain node removal records.
 
-The initial design should avoid rewrite segments. It should not copy live
-records into separate rewrite files. This keeps crash recovery and replay
-ordering simple and avoids a data-loss-prone rewrite completion protocol.
+The implementation avoids rewrite segments. It does not copy live records into
+separate rewrite files. This keeps crash recovery and replay ordering simple and
+avoids a data-loss-prone rewrite completion protocol.
 
 Instead, the engine uses whole-segment garbage collection. Whole-segment GC
 deletes only inactive append segments that are older than every active node's
@@ -349,7 +343,7 @@ each active node an initial checkpoint barrier. Removed nodes do not participate
 in the minimum barrier calculation. If no active nodes remain, GC may delete all
 inactive append segments.
 
-The current implementation stores latest checkpoint locations in a separate
+The implementation stores latest checkpoint locations in a separate
 authoritative JSON file, `checkpoints.json`:
 
 ```json
@@ -368,9 +362,9 @@ authoritative JSON file, `checkpoints.json`:
 }
 ```
 
-This file should be separate from `manifest`. The manifest is advisory and can
-be ignored when it is stale or malformed. `checkpoints.json` is authoritative
-for future deletion and useful as a replay hint. If `checkpoints.json` is
+This file is separate from `manifest`. The manifest is advisory and can be
+ignored when it is stale or malformed. `checkpoints.json` is authoritative for
+deletion decisions and useful as a replay hint. If `checkpoints.json` is
 missing, the engine behaves as if no checkpoint barriers exist. If it exists but
 is malformed, violates the schema, names a non-append segment, points at a
 non-existent segment, or points at an offset that is not a checkpoint record for

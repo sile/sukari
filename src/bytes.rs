@@ -3,20 +3,24 @@
 use std::sync::Arc;
 
 /// Reference-counted opaque application-defined byte payload.
+///
+/// Cloning this type shares the underlying bytes. This is useful for Raft
+/// command payloads and snapshot payloads, which are normally passed around as
+/// immutable byte strings.
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bytes {
     inner: Arc<[u8]>,
 }
 
 impl Bytes {
-    /// Makes a new payload from bytes.
+    /// Makes a new payload from owned bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             inner: Arc::from(bytes),
         }
     }
 
-    /// Makes a new payload from shared bytes.
+    /// Makes a new payload from shared bytes without copying.
     pub fn from_arc(bytes: Arc<[u8]>) -> Self {
         Self { inner: bytes }
     }
@@ -46,7 +50,7 @@ impl Bytes {
         self.inner.to_vec()
     }
 
-    /// Converts this payload into shared bytes.
+    /// Converts this payload into shared bytes without copying.
     pub fn into_arc(self) -> Arc<[u8]> {
         self.inner
     }
