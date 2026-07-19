@@ -365,12 +365,12 @@ when durable metadata is required. Node creation follows the same order before
 updating `nodes.json`. A stale `checkpoints.json.tmp` is ignored.
 
 Garbage collection is automatic from the library user's perspective. The engine
-checks for deletable segments after segment rotation, after a successful
-snapshot checkpoint, and after node removal. It does not require the caller to
-choose exact collection timing. When durable metadata is required, segment
-deletion is followed by a directory sync. A future `GcPolicy` can control
-thresholds such as the minimum number of inactive segments or minimum
-reclaimable bytes before deletion runs.
+checks for deletable segments after a successful snapshot checkpoint and after
+node removal. Ordinary record appends and node creation are not GC triggers
+because they do not make earlier records obsolete. If those operations leave an
+older segment inactive, a later snapshot checkpoint or node removal can collect
+it when the checkpoint barriers allow deletion. When durable metadata is
+required, segment deletion is followed by a directory sync.
 
 ## Crash Recovery
 

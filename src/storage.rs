@@ -111,12 +111,11 @@ impl StorageEngine {
         }
 
         let mut checkpoint_index = self.checkpoint_index.clone();
-        checkpoint_index.set_checkpoint_position(node_id, append.position);
+        checkpoint_index.set_checkpoint_position(node_id, append);
         checkpoint_index.save(&self.dir, self.sync)?;
         registry.save(&self.dir, self.sync)?;
         self.registry = registry;
         self.checkpoint_index = checkpoint_index;
-        self.collect_garbage()?;
         Ok(())
     }
 
@@ -209,7 +208,7 @@ impl StorageEngine {
         }
 
         let mut checkpoint_index = self.checkpoint_index.clone();
-        checkpoint_index.set_checkpoint_position(node_id, append.position);
+        checkpoint_index.set_checkpoint_position(node_id, append);
         checkpoint_index.save(&self.dir, self.sync)?;
         self.checkpoint_index = checkpoint_index;
         self.collect_garbage()?;
@@ -254,10 +253,7 @@ impl StorageEngine {
 
     fn save_record(&mut self, node_id: noraft::NodeId, record: Record) -> io::Result<()> {
         self.ensure_node_exists(node_id)?;
-        let append = self.writer.append(node_id, &record)?;
-        if append.rotated {
-            self.collect_garbage()?;
-        }
+        self.writer.append(node_id, &record)?;
         Ok(())
     }
 
@@ -315,12 +311,6 @@ struct SegmentWriter {
     unsynced_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AppendOutcome {
-    position: RecordPosition,
-    rotated: bool,
-}
-
 impl SegmentWriter {
     fn open(
         dir: &Path,
@@ -349,15 +339,13 @@ impl SegmentWriter {
         })
     }
 
-    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<AppendOutcome> {
+    fn append(&mut self, node_id: noraft::NodeId, record: &Record) -> io::Result<RecordPosition> {
         debug_assert_eq!(self.active_segment.kind, SegmentKind::Append);
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
-        let mut rotated = false;
         if self.should_rotate(written_bytes) {
             self.rotate()?;
-            rotated = true;
         }
         let record_position = RecordPosition {
             segment: self.active_segment,
@@ -369,10 +357,7 @@ impl SegmentWriter {
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
         self.after_write(written_bytes)?;
-        Ok(AppendOutcome {
-            position: record_position,
-            rotated,
-        })
+        Ok(record_position)
     }
 
     fn should_rotate(&self, written_bytes: u64) -> bool {

@@ -761,6 +761,38 @@ fn storage_engine_collects_inactive_segments_after_last_node_removal() {
 }
 
 #[test]
+fn storage_engine_does_not_collect_after_node_creation() {
+    let dir = unique_temp_dir("sukari-storage-gc-node-creation");
+    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
+        .expect("storage should open");
+    create_node(&mut engine, 1);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
+        .expect("term should be stored");
+    engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect("node should be removed");
+    assert!(!segment_path(&dir).exists());
+    assert!(segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+
+    create_node(&mut engine, 2);
+    assert!(segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
+    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
+    drop(engine);
+
+    let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    assert_eq!(
+        engine
+            .load(noraft::NodeId::new(2))
+            .expect("new node state should load")
+            .current_term,
+        noraft::Term::ZERO
+    );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
 fn storage_state_applies_log_suffix_replacement() {
     let mut state = StorageState::default();
     let mut commands = BTreeMap::new();

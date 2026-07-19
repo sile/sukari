@@ -15,10 +15,6 @@
 
 - Document the `SKR1` format once the first release boundary is clear.
 
-## Compaction And Garbage Collection
-
-- Define `GcPolicy` thresholds for opportunistic deletion.
-
 ## Testing
 
 - Expand focused unit tests for explicit error paths.
