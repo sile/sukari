@@ -147,7 +147,11 @@ N bytes  byte payload
 
 ## Limits
 
-The current implementation rejects frame bodies larger than 64 MiB. It also
-rejects decoded byte slices larger than 64 MiB and decoded set or entry counts
-larger than 1,000,000. These limits are defensive parser bounds, not a target
-for large payload support.
+The current implementation rejects frame bodies larger than 1 GiB. It also
+rejects decoded byte slices larger than 1 GiB and decoded set or entry counts
+larger than 1,000,000. These limits are parser safety bounds for malformed
+storage files, not recommended snapshot or append-entry size limits.
+
+Operational payload size limits belong to higher layers that know the workload.
+At this layer, large records primarily matter because frame bodies are encoded
+and decoded in memory.

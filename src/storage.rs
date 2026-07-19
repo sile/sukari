@@ -28,7 +28,7 @@ const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
 const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
-const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
+const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
 const MAX_SET_ITEMS: u64 = 1_000_000;
 
 /// Storage synchronization policy.
@@ -1626,7 +1626,7 @@ fn scan_record_frame(file: &mut File, stats: &StorageStatsCounters) -> io::Resul
             .try_into()
             .expect("segment header length should be four bytes"),
     );
-    if MAX_RECORD_LEN < body_len {
+    if MAX_RECORD_BODY_LEN < body_len {
         return Err(invalid_data("segment record is too large"));
     }
 
@@ -1711,7 +1711,7 @@ fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<V
     let body = body.finish();
 
     let body_len = u32::try_from(body.len()).map_err(|_| invalid_input("record is too large"))?;
-    if MAX_RECORD_LEN < body_len {
+    if MAX_RECORD_BODY_LEN < body_len {
         return Err(invalid_input("record is too large"));
     }
 
@@ -1744,7 +1744,7 @@ fn read_record_body(
             .try_into()
             .expect("segment header length should be four bytes"),
     );
-    if MAX_RECORD_LEN < body_len {
+    if MAX_RECORD_BODY_LEN < body_len {
         return Err(invalid_data("segment record is too large"));
     }
 
@@ -2136,7 +2136,7 @@ impl<'a> Decoder<'a> {
 
     fn get_bytes(&mut self) -> io::Result<&'a [u8]> {
         let len = self.get_u64()?;
-        if u64::from(MAX_RECORD_LEN) < len {
+        if u64::from(MAX_RECORD_BODY_LEN) < len {
             return Err(invalid_data("byte slice is too large"));
         }
         let len = usize::try_from(len).map_err(|_| invalid_data("byte slice is too large"))?;

@@ -23,6 +23,7 @@ const NODE_REGISTRY_TMP_FILE_NAME: &str = "nodes.json.tmp";
 const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
 const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const SEGMENT_HEADER_LEN: u64 = 12;
+const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
 
 #[test]
 fn log_append_requires_command_payloads() {
@@ -1904,6 +1905,24 @@ fn storage_engine_rejects_corrupted_checksum() {
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
         .expect_err("corrupted segment should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_rejects_over_limit_record_body_len() {
+    let dir = unique_temp_dir("sukari-storage-over-limit-record-body");
+    std::fs::create_dir_all(&dir).expect("temporary directory should be created");
+    let mut file = std::fs::File::create(segment_path(&dir)).expect("segment should be created");
+    file.write_all(b"SKR1")
+        .expect("segment magic should be written");
+    file.write_all(&(MAX_RECORD_BODY_LEN + 1).to_le_bytes())
+        .expect("over-limit body length should be written");
+    drop(file);
+
+    let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
+        .expect_err("over-limit body length should fail before reading body bytes");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
