@@ -18,7 +18,6 @@
 ## Testing
 
 - Expand focused unit tests for explicit error paths.
-- Add property-based tests for record encoding and replay round trips.
 - Add fuzzing for arbitrary segment input.
 - Add crash-recovery tests for segment rotation, checkpoint persistence,
   `checkpoints.json` updates, and segment deletion ordering.

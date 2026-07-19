@@ -15,3 +15,6 @@ keywords = ["raft", "storage", "wal", "multi-raft"]
 noraft = { git = "https://github.com/sile/noraft", branch = "main" }
 # Node registry JSON parsing and formatting.
 nojson = "0.3"
+
+[workspace]
+members = ["pbt"]
