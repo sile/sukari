@@ -53,12 +53,13 @@ one active shared append segment at a time:
 storage/
   nodes.json
   manifest
-  append-000001.segment
-  append-000002.segment
+  append-0.segment
+  append-1.segment
 ```
 
 Segment file names are parsed into internal segment names with a segment kind
-and non-zero numeric segment ID. Startup reads an advisory manifest when it is
+and canonical decimal segment ID. Append segment IDs start at `0` and are
+written without zero padding. Startup reads an advisory manifest when it is
 available, validates the hinted active append segment against existing segment
 files, and follows any subsequent contiguous append segment files before opening
 the writer. Startup falls back to a file-name scan when the manifest is missing,
@@ -110,8 +111,8 @@ storage/
   nodes.json
   manifest
   checkpoints.json
-  append-000001.segment
-  append-000002.segment
+  append-0.segment
+  append-1.segment
 ```
 
 ## Node Registry
@@ -121,8 +122,8 @@ The current implementation stores a small JSON node registry file:
 ```text
 storage/
   nodes.json
-  append-000001.segment
-  append-000002.segment
+  append-0.segment
+  append-1.segment
 ```
 
 The registry records which `noraft::NodeId` values are valid for this storage
@@ -186,7 +187,7 @@ The current implementation stores a small advisory JSON manifest file:
 ```json
 {
   "version": 1,
-  "active_append_segment": "append-000002.segment"
+  "active_append_segment": "append-1.segment"
 }
 ```
 
@@ -356,11 +357,11 @@ authoritative JSON file, `checkpoints.json`:
   "version": 1,
   "nodes": {
     "1": {
-      "checkpoint_segment": "append-000010.segment",
+      "checkpoint_segment": "append-9.segment",
       "checkpoint_offset": 1234
     },
     "2": {
-      "checkpoint_segment": "append-000008.segment",
+      "checkpoint_segment": "append-7.segment",
       "checkpoint_offset": 0
     }
   }

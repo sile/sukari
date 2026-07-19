@@ -11,11 +11,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const SEGMENT_FILE_NAME: &str = "append-000001.segment";
-const SECOND_SEGMENT_FILE_NAME: &str = "append-000002.segment";
-const THIRD_SEGMENT_FILE_NAME: &str = "append-000003.segment";
-const FOURTH_SEGMENT_FILE_NAME: &str = "append-000004.segment";
-const FIFTH_SEGMENT_FILE_NAME: &str = "append-000005.segment";
+const SEGMENT_FILE_NAME: &str = "append-0.segment";
+const SECOND_SEGMENT_FILE_NAME: &str = "append-1.segment";
+const THIRD_SEGMENT_FILE_NAME: &str = "append-2.segment";
+const FOURTH_SEGMENT_FILE_NAME: &str = "append-3.segment";
+const FIFTH_SEGMENT_FILE_NAME: &str = "append-4.segment";
 const MANIFEST_FILE_NAME: &str = "manifest";
 const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
 const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
@@ -177,7 +177,7 @@ fn storage_engine_reports_typed_stats() {
 
     let initial_stats = engine.stats();
     assert_eq!(initial_stats.active_nodes, 0);
-    assert_eq!(initial_stats.active_append_segment_id, 1);
+    assert_eq!(initial_stats.active_append_segment_id, 0);
 
     create_node(&mut engine, 1);
     engine
@@ -229,7 +229,7 @@ fn storage_engine_reports_typed_stats() {
     assert_eq!(stats.active_nodes, 1);
     assert_eq!(stats.removed_nodes, 0);
     assert_eq!(stats.checkpoint_index_nodes, 1);
-    assert_eq!(stats.active_append_segment_id, 5);
+    assert_eq!(stats.active_append_segment_id, 4);
     assert!(0 < stats.active_append_segment_len_bytes);
     assert_eq!(stats.records_replayed.snapshot_checkpoint, 0);
 
@@ -573,7 +573,7 @@ fn storage_engine_persists_checkpoint_index_positions() {
     let checkpoint_index = read_checkpoint_index(&dir);
     assert!(checkpoint_index.contains(r#""version": 1"#));
     assert!(checkpoint_index.contains(r#""1": {"#));
-    assert!(checkpoint_index.contains(r#""checkpoint_segment": "append-000003.segment""#));
+    assert!(checkpoint_index.contains(r#""checkpoint_segment": "append-2.segment""#));
     assert!(checkpoint_index.contains(r#""checkpoint_offset": 0"#));
     assert!(!segment_path(&dir).exists());
     assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
@@ -621,7 +621,7 @@ fn storage_engine_rejects_invalid_checkpoint_index_files() {
         ("missing-nodes", r#"{"version":1}"#),
         (
             "invalid-node-id",
-            r#"{"version":1,"nodes":{"abc":{"checkpoint_segment":"append-000001.segment","checkpoint_offset":0}}}"#,
+            r#"{"version":1,"nodes":{"abc":{"checkpoint_segment":"append-0.segment","checkpoint_offset":0}}}"#,
         ),
         (
             "missing-checkpoint-segment",
@@ -629,15 +629,19 @@ fn storage_engine_rejects_invalid_checkpoint_index_files() {
         ),
         (
             "missing-checkpoint-offset",
-            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000001.segment"}}}"#,
+            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-0.segment"}}}"#,
         ),
         (
             "invalid-segment-name",
             r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"bad.segment","checkpoint_offset":0}}}"#,
         ),
         (
+            "non-canonical-segment-name",
+            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-01.segment","checkpoint_offset":0}}}"#,
+        ),
+        (
             "rewrite-segment",
-            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"rewrite-000001.segment","checkpoint_offset":0}}}"#,
+            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"rewrite-0.segment","checkpoint_offset":0}}}"#,
         ),
         (
             "missing-segment",
@@ -645,11 +649,11 @@ fn storage_engine_rejects_invalid_checkpoint_index_files() {
         ),
         (
             "offset-too-large",
-            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000001.segment","checkpoint_offset":999999}}}"#,
+            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-0.segment","checkpoint_offset":999999}}}"#,
         ),
         (
             "offset-inside-record",
-            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000001.segment","checkpoint_offset":1}}}"#,
+            r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-0.segment","checkpoint_offset":1}}}"#,
         ),
     ] {
         let dir = unique_temp_dir(&format!("sukari-storage-invalid-checkpoint-index-{name}"));
@@ -677,7 +681,7 @@ fn storage_engine_rejects_checkpoint_index_that_points_to_non_checkpoint_record(
 
     write_checkpoint_index(
         &dir,
-        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-000002.segment","checkpoint_offset":0}}}"#,
+        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-1.segment","checkpoint_offset":0}}}"#,
     );
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
@@ -709,7 +713,7 @@ fn storage_engine_rejects_checkpoint_index_node_id_mismatch() {
 
     write_checkpoint_index(
         &dir,
-        r#"{"version":1,"nodes":{"2":{"checkpoint_segment":"append-000001.segment","checkpoint_offset":0}}}"#,
+        r#"{"version":1,"nodes":{"2":{"checkpoint_segment":"append-0.segment","checkpoint_offset":0}}}"#,
     );
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
@@ -1335,7 +1339,7 @@ fn storage_engine_writes_manifest_for_active_append_segment() {
 
     let manifest = read_manifest(&dir);
     assert!(manifest.contains(r#""version": 1"#));
-    assert!(manifest.contains(r#""active_append_segment": "append-000002.segment""#));
+    assert!(manifest.contains(r#""active_append_segment": "append-1.segment""#));
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
@@ -1385,7 +1389,7 @@ fn storage_engine_falls_back_from_invalid_manifest() {
     );
     drop(engine);
 
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-000002.segment""#));
+    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-1.segment""#));
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
@@ -1395,11 +1399,15 @@ fn storage_engine_falls_back_from_stale_manifest() {
     for (case, manifest) in [
         (
             "lower-existing-segment",
-            r#"{"version":1,"active_append_segment":"append-000001.segment"}"#,
+            r#"{"version":1,"active_append_segment":"append-0.segment"}"#,
         ),
         (
             "missing-segment",
             r#"{"version":1,"active_append_segment":"append-999999.segment"}"#,
+        ),
+        (
+            "non-canonical-segment-name",
+            r#"{"version":1,"active_append_segment":"append-01.segment"}"#,
         ),
     ] {
         let dir = unique_temp_dir(&format!("sukari-storage-stale-manifest-{case}"));
@@ -1436,7 +1444,7 @@ fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
         .expect("empty next segment should be created");
     write_manifest(
         &dir,
-        r#"{"version":1,"active_append_segment":"append-000002.segment"}"#,
+        r#"{"version":1,"active_append_segment":"append-1.segment"}"#,
     );
 
     let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
@@ -1455,7 +1463,7 @@ fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
 
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-000003.segment""#));
+    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(
@@ -1477,7 +1485,7 @@ fn storage_engine_recovers_empty_segment_created_after_manifest_update() {
         .expect("empty next segment should be created");
     write_manifest(
         &dir,
-        r#"{"version":1,"active_append_segment":"append-000003.segment"}"#,
+        r#"{"version":1,"active_append_segment":"append-2.segment"}"#,
     );
 
     let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
@@ -1496,7 +1504,7 @@ fn storage_engine_recovers_empty_segment_created_after_manifest_update() {
 
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-000003.segment""#));
+    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
 
     let engine = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
     assert_eq!(

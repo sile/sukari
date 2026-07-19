@@ -9,7 +9,7 @@ use std::{
 use libfuzzer_sys::fuzz_target;
 use sukari::{StorageEngine, SyncPolicy};
 
-const SEGMENT_FILE_NAME: &str = "append-000001.segment";
+const SEGMENT_FILE_NAME: &str = "append-0.segment";
 const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
 const NODE_REGISTRY: &[u8] =
     br#"{"version":1,"nodes":{"1":{"startup":true,"metadata":{},"removed":false}}}"#;

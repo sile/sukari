@@ -20,7 +20,6 @@ const SEGMENT_BASE_HEADER_LEN: usize = 8;
 const SEGMENT_CHECKSUM_LEN: usize = 4;
 const SEGMENT_HEADER_LEN: usize = SEGMENT_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
 const SEGMENT_FILE_SUFFIX: &str = ".segment";
-const SEGMENT_ID_WIDTH: usize = 6;
 const MANIFEST_FILE_NAME: &str = "manifest";
 const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
 const MANIFEST_VERSION: u64 = 1;
@@ -741,11 +740,7 @@ struct NodeRecord {
 struct SegmentId(u64);
 
 impl SegmentId {
-    const FIRST: Self = Self(1);
-
-    fn new(id: u64) -> Option<Self> {
-        (id != 0).then_some(Self(id))
-    }
+    const FIRST: Self = Self(0);
 
     fn get(self) -> u64 {
         self.0
@@ -756,7 +751,7 @@ impl SegmentId {
             .0
             .checked_add(1)
             .ok_or_else(|| invalid_data("segment ID overflow"))?;
-        Self::new(id).ok_or_else(|| invalid_data("segment ID overflow"))
+        Ok(Self(id))
     }
 }
 
@@ -810,10 +805,13 @@ impl SegmentName {
         let name = file_name.strip_suffix(SEGMENT_FILE_SUFFIX)?;
         let (prefix, id) = name.split_once('-')?;
         let kind = SegmentKind::parse_prefix(prefix)?;
-        if id.len() != SEGMENT_ID_WIDTH || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        let id = id.parse().ok().and_then(SegmentId::new)?;
+        if id.len() > 1 && id.starts_with('0') {
+            return None;
+        }
+        let id = SegmentId(id.parse().ok()?);
         Some(Self { kind, id })
     }
 
@@ -827,11 +825,10 @@ impl SegmentName {
 
     fn file_name(self) -> String {
         format!(
-            "{}-{:0width$}{}",
+            "{}-{}{}",
             self.kind.prefix(),
             self.id.get(),
-            SEGMENT_FILE_SUFFIX,
-            width = SEGMENT_ID_WIDTH
+            SEGMENT_FILE_SUFFIX
         )
     }
 }
