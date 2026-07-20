@@ -9,7 +9,6 @@ This document describes the current storage architecture of `sukari`.
 The crate owns:
 
 - shared segment file format
-- advisory manifest format
 - garbage-collection metadata format
 - deterministic replay
 - per-node replay state
@@ -50,21 +49,18 @@ shared append segment at a time:
 ```text
 storage/
   nodes.json
-  manifest
+  checkpoints.json
   append-0.segment
   append-1.segment
 ```
 
 Segment file names are parsed into internal append segment names with canonical
 decimal segment IDs. Append segment IDs start at `0` and are written without
-zero padding. Startup reads an advisory manifest when it is
-available, validates the hinted active append segment against existing segment
-files, and follows any subsequent contiguous append segment files before opening
-the writer. Startup falls back to a file-name scan when the manifest is missing,
-malformed, unsupported, names a non-append segment, or points at a non-existent
-segment. New writes rotate to the next append segment when the configured
-segment length would be exceeded. A single record that exceeds the limit is
-written to an empty segment by itself.
+zero padding. Startup selects the active append segment by scanning canonical
+append segment file names and opening the greatest segment ID. Non-segment files
+and non-canonical append segment names are ignored. New writes rotate to the next
+append segment when the configured segment length would be exceeded. A single
+record that exceeds the limit is written to an empty segment by itself.
 
 The public API exposes node ID based storage operations on a single engine
 writer:
@@ -117,7 +113,6 @@ metadata files:
 ```text
 storage/
   nodes.json
-  manifest
   checkpoints.json
   append-0.segment
   append-1.segment
@@ -187,30 +182,6 @@ segment append step for node removal.
 The registry is a storage namespace and startup-discovery mechanism. It is not
 the authoritative Raft cluster membership, group placement, or orchestration
 state; those belong to the control plane above `sukari`.
-
-## Manifest
-
-The implementation stores a small advisory JSON manifest file:
-
-```json
-{
-  "version": 1,
-  "active_append_segment": "append-1.segment"
-}
-```
-
-The manifest accelerates active append segment selection, but it is not
-authoritative. Startup ignores `manifest.tmp`. If `manifest` is missing,
-malformed, has an unsupported version, names a non-append segment, or points at a
-non-existent segment, startup falls back to scanning segment file names. If the
-hint names an older existing append segment, startup advances through subsequent
-contiguous append segment file names instead of trusting the old hint as-is.
-
-Segment rotation creates the next append segment first, syncs the segment file
-metadata when required by the sync policy, and then atomically replaces
-`manifest` through `manifest.tmp`. A crash before the rename leaves the old
-manifest in place. A crash after the rename records the new hint. Recovery must
-still discover segment files and must not depend only on the manifest.
 
 ## Snapshot Checkpoints
 
@@ -371,15 +342,13 @@ authoritative JSON file, `checkpoints.json`:
 }
 ```
 
-This file is separate from `manifest`. The manifest is advisory and can be
-ignored when it is stale or malformed. `checkpoints.json` is authoritative for
-deletion decisions and useful as a replay hint. If `checkpoints.json` is
-missing, the engine behaves as if no checkpoint barriers exist. If it exists but
-is malformed, violates the schema, names a non-append segment, points at a
-non-existent segment, or points at an offset that is not a checkpoint record for
-the target node, opening the engine fails with `InvalidData`. Well-formed
-entries for removed or unknown nodes are ignored on open, and `remove_node()`
-removes the node from the checkpoint index.
+`checkpoints.json` is authoritative for deletion decisions and useful as a
+replay hint. If `checkpoints.json` is missing, the engine behaves as if no
+checkpoint barriers exist. If it exists but is malformed, violates the schema,
+names a non-append segment, points at a non-existent segment, or points at an
+offset that is not a checkpoint record for the target node, opening the engine
+fails with `InvalidData`. Well-formed entries for removed or unknown nodes are
+ignored on open, and `remove_node()` removes the node from the checkpoint index.
 
 `checkpoints.json` is updated by atomic replacement. A checkpoint update appends
 and durably syncs the checkpoint record first when the sync policy requires it.
@@ -402,7 +371,6 @@ The storage format needs explicit recovery rules for:
 
 - partial record at the end of the active segment
 - checksum mismatch
-- stale `manifest` or `manifest.tmp` after segment creation
 - segment rotation
 - initial checkpoint record append during node creation
 - snapshot checkpoint record append

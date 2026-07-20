@@ -16,8 +16,6 @@ const SECOND_SEGMENT_FILE_NAME: &str = "append-1.segment";
 const THIRD_SEGMENT_FILE_NAME: &str = "append-2.segment";
 const FOURTH_SEGMENT_FILE_NAME: &str = "append-3.segment";
 const FIFTH_SEGMENT_FILE_NAME: &str = "append-4.segment";
-const MANIFEST_FILE_NAME: &str = "manifest";
-const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
 const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
 const NODE_REGISTRY_TMP_FILE_NAME: &str = "nodes.json.tmp";
 const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
@@ -1392,122 +1390,11 @@ fn storage_engine_rotates_and_replays_append_segments() {
 }
 
 #[test]
-fn storage_engine_writes_manifest_for_active_append_segment() {
-    let dir = unique_temp_dir("sukari-storage-manifest");
-    create_two_segment_store(&dir);
-
-    let manifest = read_manifest(&dir);
-    assert!(manifest.contains(r#""version": 1"#));
-    assert!(manifest.contains(r#""active_append_segment": "append-1.segment""#));
-
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("node state should load")
-            .current_term,
-        noraft::Term::new(2)
-    );
-
-    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
-}
-
-#[test]
-fn storage_engine_ignores_stale_manifest_tmp() {
-    let dir = unique_temp_dir("sukari-storage-manifest-tmp");
-    create_two_segment_store(&dir);
-
-    std::fs::write(dir.join(MANIFEST_TMP_FILE_NAME), "not-json")
-        .expect("stale manifest tmp file should be written");
-
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("node state should load")
-            .current_term,
-        noraft::Term::new(2)
-    );
-
-    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
-}
-
-#[test]
-fn storage_engine_falls_back_from_invalid_manifest() {
-    let dir = unique_temp_dir("sukari-storage-invalid-manifest");
-    create_two_segment_store(&dir);
-    write_manifest(&dir, "{");
-
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("node state should load")
-            .current_term,
-        noraft::Term::new(2)
-    );
-    drop(engine);
-
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-1.segment""#));
-
-    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
-}
-
-#[test]
-fn storage_engine_falls_back_from_stale_manifest() {
-    for (case, manifest) in [
-        (
-            "lower-existing-segment",
-            r#"{"version":1,"active_append_segment":"append-0.segment"}"#,
-        ),
-        (
-            "missing-segment",
-            r#"{"version":1,"active_append_segment":"append-999999.segment"}"#,
-        ),
-        (
-            "non-canonical-segment-name",
-            r#"{"version":1,"active_append_segment":"append-01.segment"}"#,
-        ),
-    ] {
-        let dir = unique_temp_dir(&format!("sukari-storage-stale-manifest-{case}"));
-        create_two_segment_store(&dir);
-        write_manifest(&dir, manifest);
-
-        let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
-            .expect("storage should reopen");
-        assert_eq!(
-            engine
-                .load(noraft::NodeId::new(1))
-                .expect("node state should load")
-                .current_term,
-            noraft::Term::new(2),
-            "case: {case}"
-        );
-        engine
-            .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
-            .expect("third term should be stored");
-        drop(engine);
-
-        assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
-        assert!(!segment_path_named(&dir, "append-999999.segment").exists());
-
-        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
-    }
-}
-
-#[test]
-fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
-    let dir = unique_temp_dir("sukari-storage-empty-segment-before-manifest");
+fn storage_engine_recovers_empty_next_segment() {
+    let dir = unique_temp_dir("sukari-storage-empty-next-segment");
     create_two_segment_store(&dir);
     std::fs::File::create(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME))
         .expect("empty next segment should be created");
-    write_manifest(
-        &dir,
-        r#"{"version":1,"active_append_segment":"append-1.segment"}"#,
-    );
 
     let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
         .expect("storage should reopen");
@@ -1525,49 +1412,6 @@ fn storage_engine_recovers_empty_segment_created_before_manifest_update() {
 
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
     assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
-
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
-    assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("node state should load")
-            .current_term,
-        noraft::Term::new(3)
-    );
-
-    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
-}
-
-#[test]
-fn storage_engine_recovers_empty_segment_created_after_manifest_update() {
-    let dir = unique_temp_dir("sukari-storage-empty-segment-after-manifest");
-    create_two_segment_store(&dir);
-    std::fs::File::create(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME))
-        .expect("empty next segment should be created");
-    write_manifest(
-        &dir,
-        r#"{"version":1,"active_append_segment":"append-2.segment"}"#,
-    );
-
-    let mut engine = StorageEngine::with_max_segment_len(&dir, SyncPolicy::UnsafeNoSync, 1)
-        .expect("storage should reopen");
-    assert_eq!(
-        engine
-            .load(noraft::NodeId::new(1))
-            .expect("node state should load")
-            .current_term,
-        noraft::Term::new(2)
-    );
-    engine
-        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
-        .expect("term should be stored in recovered segment");
-    drop(engine);
-
-    assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
-    assert!(!segment_path_named(&dir, FOURTH_SEGMENT_FILE_NAME).exists());
-    assert!(read_manifest(&dir).contains(r#""active_append_segment": "append-2.segment""#));
 
     let mut engine =
         StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
@@ -2142,19 +1986,10 @@ fn write_node_registry(dir: &Path, text: &str) {
         .expect("node registry should be written");
 }
 
-fn write_manifest(dir: &Path, text: &str) {
-    std::fs::create_dir_all(dir).expect("temporary directory should be created");
-    std::fs::write(dir.join(MANIFEST_FILE_NAME), text).expect("manifest should be written");
-}
-
 fn write_checkpoint_index(dir: &Path, text: &str) {
     std::fs::create_dir_all(dir).expect("temporary directory should be created");
     std::fs::write(dir.join(CHECKPOINT_INDEX_FILE_NAME), text)
         .expect("checkpoint index should be written");
-}
-
-fn read_manifest(dir: &Path) -> String {
-    std::fs::read_to_string(dir.join(MANIFEST_FILE_NAME)).expect("manifest should exist")
 }
 
 fn read_checkpoint_index(dir: &Path) -> String {
