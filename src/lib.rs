@@ -10,6 +10,14 @@
 //! A [`StorageEngine`] has one writer. It does not add internal synchronization
 //! for concurrent callers; runtimes that need concurrent access serialize
 //! storage requests outside this crate.
+//!
+//! ## Key Characteristics
+//!
+//! `sukari` favors a simple runtime path: ordinary writes append records to
+//! shared segments, and full reads are mainly for startup or recovery. This
+//! should make typical Raft storage writes predictable. Recovery APIs read
+//! snapshots and retained log suffixes as whole values, so huge payloads and
+//! random-read log paging are out of scope.
 
 #![forbid(unsafe_code)]
 

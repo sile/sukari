@@ -2,6 +2,14 @@
 
 This document describes the current storage architecture of `sukari`.
 
+## Key Characteristics
+
+`sukari` favors a simple runtime path: ordinary writes append records to shared
+segments, and full reads are mainly for startup or recovery. This should make
+typical Raft storage writes predictable. Recovery APIs read snapshots and
+retained log suffixes as whole values, so huge payloads and random-read log
+paging are out of scope.
+
 ## Scope
 
 `sukari` is a shared segmented storage engine for Raft state.

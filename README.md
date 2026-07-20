@@ -13,6 +13,14 @@ writes into shared append-only segment files. Higher-level runtime and
 control-plane crates can use it without taking ownership of shared storage
 format, replay, compaction, and recovery details.
 
+## Key Characteristics
+
+`sukari` favors a simple runtime path: ordinary writes append records to shared
+segments, and full reads are mainly for startup or recovery. This should make
+typical Raft storage writes predictable. Recovery APIs read snapshots and
+retained log suffixes as whole values, so huge payloads and random-read log
+paging are out of scope.
+
 ## Storage Model
 
 `StorageEngine` owns one append writer for a storage directory. It does not add
