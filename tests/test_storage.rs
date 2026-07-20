@@ -1,5 +1,6 @@
 use sukari::{
     Bytes, CommandPayload, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine,
+    load, nodes as read_only_nodes, startup_nodes as read_only_startup_nodes,
 };
 
 use std::{
@@ -73,6 +74,115 @@ fn storage_engine_replays_command_payload_tags() {
         .load(noraft::NodeId::new(1))
         .expect("node state should load");
     assert_eq!(state.command_payloads.get(&index(1)), Some(&payload));
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn storage_engine_excludes_other_writers() {
+    let dir = unique_temp_dir("sukari-storage-writer-lock");
+    let engine = StorageEngine::new(&dir).expect("storage should open");
+
+    let err = StorageEngine::new(&dir).expect_err("second writer should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert!(dir.join("write.lock").is_file());
+
+    drop(engine);
+    StorageEngine::new(&dir).expect("writer lock should be released when the engine drops");
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn read_only_storage_opens_while_a_writer_is_active() {
+    let dir = unique_temp_dir("sukari-storage-read-only-with-writer");
+    let mut engine = StorageEngine::new(&dir).expect("storage should open");
+    create_node(&mut engine, 1);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
+        .expect("term should be stored");
+    engine.sync().expect("term should be synchronized");
+
+    assert_eq!(
+        load(&dir, noraft::NodeId::new(1)).expect("node state should load"),
+        engine
+            .load(noraft::NodeId::new(1))
+            .expect("writer should load the same node state")
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn read_only_functions_reload_node_metadata() {
+    let dir = unique_temp_dir("sukari-storage-read-only-metadata");
+    let mut engine = StorageEngine::new(&dir).expect("storage should open");
+    assert!(read_only_nodes(&dir).expect("nodes should load").is_empty());
+
+    create_node(&mut engine, 1);
+    assert_eq!(
+        read_only_nodes(&dir)
+            .expect("nodes should reload")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![noraft::NodeId::new(1)]
+    );
+    assert_eq!(
+        read_only_startup_nodes(&dir)
+            .expect("startup nodes should load")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        Vec::<noraft::NodeId>::new()
+    );
+
+    engine
+        .remove_node(noraft::NodeId::new(1))
+        .expect("node should be removed");
+    assert!(
+        read_only_nodes(&dir)
+            .expect("nodes should reload after removal")
+            .is_empty()
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+}
+
+#[test]
+fn read_only_storage_keeps_an_incomplete_active_record() {
+    let dir = unique_temp_dir("sukari-storage-read-only-partial-record");
+    let mut engine = StorageEngine::new(&dir).expect("storage should open");
+    create_node(&mut engine, 1);
+    engine
+        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(3))
+        .expect("term should be stored");
+    engine.sync().expect("term should be synchronized");
+    drop(engine);
+
+    let segment_path = dir.join(SEGMENT_FILE_NAME);
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&segment_path)
+        .expect("active segment should open");
+    file.write_all(&[0, 0, 0])
+        .expect("partial record should append");
+    drop(file);
+    let len_before = std::fs::metadata(&segment_path)
+        .expect("active segment metadata should load")
+        .len();
+
+    let state = load(&dir, noraft::NodeId::new(1))
+        .expect("read-only storage should ignore a partial active record");
+    assert_eq!(state.current_term, noraft::Term::new(3));
+    assert_eq!(
+        std::fs::metadata(&segment_path)
+            .expect("active segment metadata should load")
+            .len(),
+        len_before
+    );
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }

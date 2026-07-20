@@ -2,7 +2,7 @@
 name = "sukari"
 version = "0.0.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 description = "Shared append-segment Raft state storage for noraft-based applications"
 homepage = "https://github.com/sile/sukari"

@@ -241,6 +241,7 @@ pub(crate) fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>>
 pub(crate) fn read_segment_header(
     file: &mut File,
     allow_partial: bool,
+    recover_partial: bool,
     stats: Option<&mut StorageStatsCounters>,
 ) -> io::Result<bool> {
     file.seek(SeekFrom::Start(0))?;
@@ -252,12 +253,18 @@ pub(crate) fn read_segment_header(
         return Err(invalid_data("missing segment header"));
     }
     if file_len < SEGMENT_FILE_HEADER_LEN_U64 {
-        if allow_partial {
+        if allow_partial && recover_partial {
             if let Some(stats) = stats {
                 stats.replay_truncated();
             }
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        if allow_partial {
+            if let Some(stats) = stats {
+                stats.replay_truncated();
+            }
             return Ok(false);
         }
         return Err(invalid_data("partial segment header in inactive segment"));

@@ -18,7 +18,7 @@ use crate::stats::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -27,6 +27,7 @@ const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
 const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
+const WRITE_LOCK_FILE_NAME: &str = "write.lock";
 
 /// Shared segmented storage engine for registered Raft nodes.
 ///
@@ -49,6 +50,7 @@ const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 #[derive(Debug)]
 pub struct StorageEngine {
     dir: PathBuf,
+    _write_lock: File,
     stats: StorageStatsCounters,
     registry: NodeRegistry,
     checkpoint_index: CheckpointIndex,
@@ -77,6 +79,7 @@ impl StorageEngine {
 
         let dir = dir.as_ref().to_path_buf();
         create_dir_all_synced(&dir)?;
+        let write_lock = acquire_write_lock(&dir)?;
         let active_segment = select_active_append_segment(&dir)?;
         let mut stats = StorageStatsCounters::default();
         recover_storage_dir(&dir, active_segment, &mut stats)?;
@@ -90,6 +93,7 @@ impl StorageEngine {
         let writer = SegmentWriter::open(&dir, active_segment, max_segment_len, &mut stats)?;
         Ok(Self {
             dir,
+            _write_lock: write_lock,
             stats,
             registry,
             checkpoint_index,
@@ -156,6 +160,7 @@ impl StorageEngine {
             self.writer.active_segment(),
             node_id,
             checkpoint_position,
+            true,
             &mut self.stats,
         )
     }
@@ -177,6 +182,7 @@ impl StorageEngine {
             self.writer.active_segment(),
             Some(&active_node_ids),
             checkpoint_hints,
+            true,
             &mut self.stats,
         )?;
         let mut nodes = BTreeMap::new();
@@ -377,6 +383,140 @@ impl StorageEngine {
     fn refresh_checkpoint_index_stats(&mut self) {
         self.stats
             .checkpoint_index_changed(usize_to_u64(self.checkpoint_index.len()));
+    }
+}
+
+fn acquire_write_lock(dir: &Path) -> io::Result<File> {
+    let path = dir.join(WRITE_LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "storage directory is already open for writing",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn ensure_node_exists(registry: &NodeRegistry, node_id: noraft::NodeId) -> io::Result<()> {
+    if registry.is_active(node_id) {
+        return Ok(());
+    }
+    if registry.is_removed(node_id) {
+        return Err(node_removed_error());
+    }
+    Err(node_not_found_error())
+}
+
+/// Loads the state visible through complete segment records for one node.
+///
+/// This does not acquire `write.lock`, so it can run while a [`StorageEngine`]
+/// is writing. It never recovers partial records, removes segments, or
+/// otherwise changes the directory. The metadata JSON files are read for each
+/// call. The result is not a point-in-time snapshot when a writer is active.
+pub fn load<P: AsRef<Path>>(dir: P, node_id: noraft::NodeId) -> io::Result<NodeState> {
+    ReadOnlyStorage::open(dir)?.load(node_id)
+}
+
+/// Loads the states visible through complete segment records for all active nodes.
+///
+/// See [`load`] for concurrent writer semantics.
+pub fn load_all<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, NodeState>> {
+    ReadOnlyStorage::open(dir)?.load_all()
+}
+
+/// Returns all active Raft nodes and their metadata.
+///
+/// The metadata JSON file is read for each call.
+pub fn nodes<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, NodeMetadata>> {
+    Ok(ReadOnlyStorage::open(dir)?
+        .registry
+        .nodes()
+        .map(|(node_id, metadata)| (node_id, metadata.clone()))
+        .collect())
+}
+
+/// Returns active Raft nodes marked for process startup and their metadata.
+///
+/// The metadata JSON file is read for each call.
+pub fn startup_nodes<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, NodeMetadata>> {
+    Ok(ReadOnlyStorage::open(dir)?
+        .registry
+        .startup_nodes()
+        .map(|(node_id, metadata)| (node_id, metadata.clone()))
+        .collect())
+}
+
+#[derive(Debug)]
+struct ReadOnlyStorage {
+    dir: PathBuf,
+    stats: StorageStatsCounters,
+    registry: NodeRegistry,
+    checkpoint_index: CheckpointIndex,
+}
+
+impl ReadOnlyStorage {
+    fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        if !std::fs::metadata(&dir)?.is_dir() {
+            return Err(invalid_input("storage path is not a directory"));
+        }
+
+        let mut stats = StorageStatsCounters::default();
+        let registry = NodeRegistry::load(&dir)?;
+        let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
+        stats.registry_loaded(
+            usize_to_u64(registry.active_node_count()),
+            usize_to_u64(registry.removed_node_count()),
+        );
+        stats.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
+        Ok(Self {
+            dir,
+            stats,
+            registry,
+            checkpoint_index,
+        })
+    }
+
+    fn load(&mut self, node_id: noraft::NodeId) -> io::Result<NodeState> {
+        ensure_node_exists(&self.registry, node_id)?;
+        let checkpoint_position = self.checkpoint_index.checkpoint_position(node_id);
+        replay_node_state(
+            &self.dir,
+            select_active_append_segment(&self.dir)?,
+            node_id,
+            checkpoint_position,
+            false,
+            &mut self.stats,
+        )
+    }
+
+    fn load_all(&mut self) -> io::Result<BTreeMap<noraft::NodeId, NodeState>> {
+        let active_node_ids = self.registry.active_node_ids();
+        if active_node_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let checkpoint_hints = self.checkpoint_index.checkpoint_positions(&active_node_ids);
+        let mut replay = replay_storage_dir(
+            &self.dir,
+            select_active_append_segment(&self.dir)?,
+            Some(&active_node_ids),
+            checkpoint_hints,
+            false,
+            &mut self.stats,
+        )?;
+        let mut nodes = BTreeMap::new();
+        for node_id in active_node_ids {
+            nodes.insert(node_id, replay.nodes.remove(&node_id).unwrap_or_default());
+        }
+        Ok(nodes)
     }
 }
 
@@ -883,7 +1023,7 @@ fn validate_checkpoint_position(
 
     let segment_path = position.segment.path(dir);
     let mut file = OpenOptions::new().read(true).open(&segment_path)?;
-    read_segment_header(&mut file, false, None)?;
+    read_segment_header(&mut file, false, false, None)?;
     let file_len = file.metadata()?.len();
     if position.offset < SEGMENT_FILE_HEADER_LEN_U64 {
         return Err(invalid_data("checkpoint index offset precedes records"));
@@ -944,6 +1084,7 @@ fn replay_node_state(
     active_segment: SegmentName,
     node_id: noraft::NodeId,
     checkpoint_hint: Option<RecordPosition>,
+    recover_partial: bool,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<NodeState> {
     let mut target_nodes = BTreeSet::new();
@@ -953,12 +1094,15 @@ fn replay_node_state(
         active_segment,
         Some(&target_nodes),
         checkpoint_hint,
+        recover_partial,
         stats,
     )?;
     let checkpoint_position = checkpoint_positions.get(&node_id).copied();
 
     let mut state = NodeState::default();
-    for segment in discover_segment_paths(dir)? {
+    let segments = discover_segment_paths(dir)?;
+    let active_segment = replay_active_segment(&segments, active_segment, recover_partial);
+    for segment in segments {
         if checkpoint_position.is_some_and(|checkpoint| segment.name < checkpoint.segment) {
             continue;
         }
@@ -968,6 +1112,7 @@ fn replay_node_state(
             allow_partial,
             node_id,
             checkpoint_position,
+            recover_partial,
             &mut state,
             stats,
         )?;
@@ -980,12 +1125,21 @@ fn replay_storage_dir(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
+    recover_partial: bool,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<ReplayState> {
-    let (checkpoint_positions, replay_start_segment) =
-        checkpoint_positions_for_replay(dir, active_segment, node_filter, checkpoint_hints, stats)?;
+    let (checkpoint_positions, replay_start_segment) = checkpoint_positions_for_replay(
+        dir,
+        active_segment,
+        node_filter,
+        checkpoint_hints,
+        recover_partial,
+        stats,
+    )?;
     let mut replay = ReplayState::default();
-    for segment in discover_segment_paths(dir)? {
+    let segments = discover_segment_paths(dir)?;
+    let active_segment = replay_active_segment(&segments, active_segment, recover_partial);
+    for segment in segments {
         if replay_start_segment.is_some_and(|start| segment.name < start) {
             continue;
         }
@@ -995,6 +1149,7 @@ fn replay_storage_dir(
             allow_partial,
             node_filter,
             &checkpoint_positions,
+            recover_partial,
             &mut replay,
             stats,
         )?;
@@ -1007,13 +1162,14 @@ fn checkpoint_positions_for_replay(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
+    recover_partial: bool,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<(
     BTreeMap<noraft::NodeId, RecordPosition>,
     Option<SegmentName>,
 )> {
     let Some(mut checkpoint_positions) = checkpoint_hints else {
-        return find_checkpoint_positions(dir, active_segment, node_filter, stats)
+        return find_checkpoint_positions(dir, active_segment, node_filter, recover_partial, stats)
             .map(|positions| (positions, None));
     };
 
@@ -1025,6 +1181,7 @@ fn checkpoint_positions_for_replay(
         active_segment,
         node_filter,
         Some(start_position),
+        recover_partial,
         stats,
     )?;
     checkpoint_positions.extend(discovered);
@@ -1047,9 +1204,17 @@ fn find_checkpoint_positions(
     dir: &Path,
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
+    recover_partial: bool,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
-    find_checkpoint_positions_from(dir, active_segment, node_filter, None, stats)
+    find_checkpoint_positions_from(
+        dir,
+        active_segment,
+        node_filter,
+        None,
+        recover_partial,
+        stats,
+    )
 }
 
 fn find_checkpoint_positions_from(
@@ -1057,10 +1222,13 @@ fn find_checkpoint_positions_from(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     start_position: Option<RecordPosition>,
+    recover_partial: bool,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
     let mut checkpoints = BTreeMap::new();
-    for segment in discover_segment_paths(dir)? {
+    let segments = discover_segment_paths(dir)?;
+    let active_segment = replay_active_segment(&segments, active_segment, recover_partial);
+    for segment in segments {
         if start_position.is_some_and(|start| segment.name < start.segment) {
             continue;
         }
@@ -1073,6 +1241,7 @@ fn find_checkpoint_positions_from(
             allow_partial,
             node_filter,
             start_offset,
+            recover_partial,
             &mut checkpoints,
             stats,
         )?;
@@ -1080,19 +1249,34 @@ fn find_checkpoint_positions_from(
     Ok(checkpoints)
 }
 
+fn replay_active_segment(
+    segments: &[SegmentPath],
+    active_segment: SegmentName,
+    recover_partial: bool,
+) -> SegmentName {
+    if recover_partial {
+        return active_segment;
+    }
+    segments
+        .last()
+        .map(|segment| segment.name)
+        .unwrap_or(active_segment)
+}
+
 fn scan_checkpoint_positions(
     segment: &SegmentPath,
     allow_partial: bool,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     start_offset: Option<u64>,
+    recover_partial: bool,
     checkpoints: &mut BTreeMap<noraft::NodeId, RecordPosition>,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
-        .write(allow_partial)
+        .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
@@ -1115,8 +1299,10 @@ fn scan_checkpoint_positions(
             }
             if allow_partial {
                 stats.replay_truncated();
-                file.set_len(record_start)?;
-                file.seek(SeekFrom::Start(record_start))?;
+                if recover_partial {
+                    file.set_len(record_start)?;
+                    file.seek(SeekFrom::Start(record_start))?;
+                }
                 break;
             }
             return Err(invalid_data("partial record in inactive segment"));
@@ -1145,14 +1331,15 @@ fn replay_segment(
     allow_partial: bool,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_positions: &BTreeMap<noraft::NodeId, RecordPosition>,
+    recover_partial: bool,
     replay: &mut ReplayState,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
-        .write(allow_partial)
+        .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
@@ -1165,8 +1352,10 @@ fn replay_segment(
             }
             if allow_partial {
                 stats.replay_truncated();
-                file.set_len(record_start)?;
-                file.seek(SeekFrom::Start(record_start))?;
+                if recover_partial {
+                    file.set_len(record_start)?;
+                    file.seek(SeekFrom::Start(record_start))?;
+                }
                 break;
             }
             return Err(invalid_data("partial record in inactive segment"));
@@ -1198,14 +1387,15 @@ fn replay_node_segment(
     allow_partial: bool,
     target_node_id: noraft::NodeId,
     checkpoint_position: Option<RecordPosition>,
+    recover_partial: bool,
     state: &mut NodeState,
     stats: &mut StorageStatsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
-        .write(allow_partial)
+        .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
@@ -1218,8 +1408,10 @@ fn replay_node_segment(
             }
             if allow_partial {
                 stats.replay_truncated();
-                file.set_len(record_start)?;
-                file.seek(SeekFrom::Start(record_start))?;
+                if recover_partial {
+                    file.set_len(record_start)?;
+                    file.seek(SeekFrom::Start(record_start))?;
+                }
                 break;
             }
             return Err(invalid_data("partial record in inactive segment"));
@@ -1252,7 +1444,7 @@ fn scan_segment(
         .read(true)
         .write(allow_partial)
         .open(path)?;
-    if !read_segment_header(&mut file, allow_partial, Some(stats))? {
+    if !read_segment_header(&mut file, allow_partial, true, Some(stats))? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();

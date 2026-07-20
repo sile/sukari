@@ -7,9 +7,14 @@
 //! on-disk storage format, recovery, replay, snapshot checkpoints, node
 //! registry metadata, and whole-segment garbage collection.
 //!
-//! A [`StorageEngine`] has one writer. It does not add internal synchronization
-//! for concurrent callers; runtimes that need concurrent access serialize
-//! storage requests outside this crate.
+//! A [`StorageEngine`] has one writer and takes an exclusive OS file lock on
+//! `write.lock`. The read-only [`load`] and [`load_all`] functions can access
+//! the same directory concurrently, but never modify it. The storage directory
+//! must be on a local filesystem;
+//! network filesystems are not supported.
+//!
+//! `StorageEngine` does not add internal synchronization for concurrent callers;
+//! runtimes that need concurrent access serialize storage requests outside this crate.
 //!
 //! ## Key Characteristics
 //!
@@ -40,5 +45,6 @@ pub use bytes::Bytes;
 pub use registry::NodeMetadata;
 pub use stats::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
 pub use storage::{
-    CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
+    CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, load,
+    load_all, nodes, startup_nodes,
 };

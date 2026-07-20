@@ -56,6 +56,7 @@ storage directory uses shared append segments plus small JSON metadata files:
 
 ```text
 storage/
+  write.lock
   nodes.json
   checkpoints.json
   append-0.segment
@@ -72,6 +73,25 @@ configured length is a rotation threshold, not a hard per-record limit. If a
 record frame is larger than the threshold, the writer rotates once when needed,
 writes the frame to an empty segment, and lets that segment exceed the
 threshold.
+
+## Access Modes
+
+`StorageEngine` is the read-write access mode. It opens or creates the
+persistent `write.lock` file and acquires an exclusive OS file lock for its
+lifetime. A second `StorageEngine` for the same directory fails to open while
+the lock is held. The lock is released when the engine drops, but `write.lock`
+is intentionally not removed: its existence does not mean a writer is active.
+
+The crate supports local filesystems only. Network filesystem behavior,
+including file locking, is not supported.
+
+The read-only functions `sukari::load()`, `sukari::load_all()`,
+`sukari::nodes()`, and `sukari::startup_nodes()` do not acquire `write.lock`.
+They can run while a writer is active and never recover, truncate, garbage
+collect, or otherwise modify the directory. Each call reads `nodes.json` and
+`checkpoints.json` again, so node creation and removal become visible to later
+read-only calls. A concurrent read can observe complete records available while
+it runs, but does not provide a point-in-time snapshot.
 
 The public API exposes node ID based storage operations on a single engine
 writer:
@@ -251,10 +271,11 @@ first checkpoint. The checkpoint index is not a general random-read index for
 log paging. If the index is stale, replay scans from the hinted checkpoint
 record forward and can still discover a newer checkpoint.
 
-The active segment tolerates a trailing partial record and truncates it during
-replay. Inactive segments do not tolerate trailing partial records because they
-must have been completed before a later active segment became visible. Checksum
-mismatches are treated as corruption.
+During `StorageEngine` recovery, the active segment tolerates a trailing partial
+record and truncates it. Read-only functions instead ignore a trailing partial
+record without changing the segment. Inactive segments do not tolerate trailing
+partial records because they must have been completed before a later active
+segment became visible. Checksum mismatches are treated as corruption.
 
 ## Memory Model
 

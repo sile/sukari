@@ -79,9 +79,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Storage Model
 
-`StorageEngine` owns one append writer for a storage directory. It does not add
-internal mutexes around writes; runtimes that need concurrent access serialize
-storage requests outside this crate.
+`StorageEngine` owns one append writer for a storage directory. It acquires an
+exclusive OS file lock on the persistent `write.lock` file, so a second writer
+for the same directory fails to open. The lock is released when the engine is
+dropped; the `write.lock` file itself remains. `sukari` supports local
+filesystems only, not network filesystems.
+
+Read-only startup and recovery can run concurrently with the writer through
+`sukari::load()`, `sukari::load_all()`, `sukari::nodes()`, and
+`sukari::startup_nodes()`. These functions do not acquire `write.lock` or
+modify the storage directory. They read `nodes.json` and `checkpoints.json` for
+each call, so node creation and removal by the writer are reflected by later
+calls. A concurrent read observes complete records available while it runs; it
+is not a point-in-time snapshot.
+
+`StorageEngine` does not add internal mutexes around writes; runtimes that need
+concurrent access serialize storage requests outside this crate.
 
 Segment append durability is caller-managed. Ordinary node-state writes append
 records without synchronizing the active segment; callers decide when to make
