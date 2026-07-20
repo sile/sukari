@@ -1,5 +1,7 @@
 //! Storage statistics.
 
+use core::fmt;
+
 /// Runtime storage counter and gauge snapshot.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StorageStats {
@@ -70,6 +72,47 @@ pub struct StorageStats {
     pub unsynced_bytes: u64,
 }
 
+impl nojson::DisplayJson for StorageStats {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            f.member("records_written", self.records_written)?;
+            f.member("bytes_written", self.bytes_written)?;
+            f.member("records_replayed", self.records_replayed)?;
+            f.member("bytes_replayed", self.bytes_replayed)?;
+            f.member("segment_rotations", self.segment_rotations)?;
+            f.member("flushes", self.flushes)?;
+            f.member("durable_syncs", self.durable_syncs)?;
+            f.member("replay_truncations", self.replay_truncations)?;
+            f.member("checksum_failures", self.checksum_failures)?;
+            f.member("nodes_created", self.nodes_created)?;
+            f.member("nodes_removed", self.nodes_removed)?;
+            f.member("rejected_operations", &self.rejected_operations)?;
+            f.member(
+                "snapshot_checkpoints_saved",
+                self.snapshot_checkpoints_saved,
+            )?;
+            f.member("gc_runs", self.gc_runs)?;
+            f.member("gc_segments_deleted", self.gc_segments_deleted)?;
+            f.member("active_nodes", self.active_nodes)?;
+            f.member("removed_nodes", self.removed_nodes)?;
+            f.member("checkpoint_index_nodes", self.checkpoint_index_nodes)?;
+            f.member("active_append_segment_id", self.active_append_segment_id)?;
+            f.member(
+                "active_append_segment_len_bytes",
+                self.active_append_segment_len_bytes,
+            )?;
+            f.member("unsynced_records", self.unsynced_records)?;
+            f.member("unsynced_bytes", self.unsynced_bytes)
+        })
+    }
+}
+
+impl fmt::Display for StorageStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_json(self, f)
+    }
+}
+
 /// Statistics keyed by segment record kind.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RecordKindStats {
@@ -86,6 +129,23 @@ pub struct RecordKindStats {
     pub snapshot_checkpoint: u64,
 }
 
+impl nojson::DisplayJson for RecordKindStats {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            f.member("current_term", self.current_term)?;
+            f.member("voted_for", self.voted_for)?;
+            f.member("log_append", self.log_append)?;
+            f.member("snapshot_checkpoint", self.snapshot_checkpoint)
+        })
+    }
+}
+
+impl fmt::Display for RecordKindStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_json(self, f)
+    }
+}
+
 /// Rejected operation statistics.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RejectedOperationStats {
@@ -94,6 +154,21 @@ pub struct RejectedOperationStats {
 
     /// Operations rejected because the node has been removed.
     pub removed_nodes: OperationKindStats,
+}
+
+impl nojson::DisplayJson for RejectedOperationStats {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            f.member("unknown_nodes", self.unknown_nodes)?;
+            f.member("removed_nodes", self.removed_nodes)
+        })
+    }
+}
+
+impl fmt::Display for RejectedOperationStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_json(self, f)
+    }
 }
 
 /// Statistics keyed by storage operation kind.
@@ -116,6 +191,25 @@ pub struct OperationKindStats {
 
     /// `StorageEngine::remove_node` rejections.
     pub remove_node: u64,
+}
+
+impl nojson::DisplayJson for OperationKindStats {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
+        f.object(|f| {
+            f.member("load", self.load)?;
+            f.member("save_current_term", self.save_current_term)?;
+            f.member("save_voted_for", self.save_voted_for)?;
+            f.member("append_entries", self.append_entries)?;
+            f.member("save_snapshot", self.save_snapshot)?;
+            f.member("remove_node", self.remove_node)
+        })
+    }
+}
+
+impl fmt::Display for OperationKindStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_json(self, f)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -340,4 +434,12 @@ fn increment(counter: &mut u64, value: u64) {
 
 fn load(counter: &u64) -> u64 {
     *counter
+}
+
+fn display_json<T: nojson::DisplayJson>(value: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+        f,
+        "{}",
+        nojson::json(|json| nojson::DisplayJson::fmt(value, json))
+    )
 }
