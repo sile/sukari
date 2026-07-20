@@ -23,10 +23,11 @@ Each record frame has this layout:
 N bytes  body
 ```
 
-Readers treat checksum mismatches, unknown tags, unsupported formats,
-over-limit lengths, and trailing garbage in inactive segments as corruption. A
-trailing partial header or frame is tolerated only in the active append segment
-and is truncated during recovery or replay.
+Frame-level recovery validates segment magic, body lengths, and CRC-32C
+checksums before the writer is opened. Record decoding and replay treat unknown
+tags, malformed payloads, and trailing garbage in inactive segments as
+corruption. A trailing partial header or frame is tolerated only in the active
+append segment and is truncated during recovery or replay.
 
 ## Record Body
 
