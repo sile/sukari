@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod bytes;
+mod crc32c;
 mod registry;
 mod stats;
 mod storage;

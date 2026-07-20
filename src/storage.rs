@@ -1,6 +1,7 @@
 //! Shared segmented storage model for Raft node state.
 
 use crate::bytes::Bytes;
+use crate::crc32c::{Crc32c, crc32c};
 use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_removed_error};
 use crate::stats::{
     NodeAccessErrorKind, RecordKindMetric, StorageOperationKind, StorageStats, StorageStatsCounters,
@@ -1735,14 +1736,14 @@ fn scan_record_frame(file: &mut File, stats: &mut StorageStatsCounters) -> io::R
     }
     let expected_checksum = u32::from_le_bytes(checksum);
 
-    let mut crc = crc32c_initial();
+    let mut crc = Crc32c::new();
     let mut remaining = u64::from(body_len);
     let mut buffer = [0; 8192];
     while remaining != 0 {
         let read_len = remaining.min(buffer.len() as u64) as usize;
         match file.read_exact(&mut buffer[..read_len]) {
             Ok(()) => {
-                crc = crc32c_extend(crc, &buffer[..read_len]);
+                crc.update(&buffer[..read_len]);
                 remaining -= read_len as u64;
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -1750,7 +1751,7 @@ fn scan_record_frame(file: &mut File, stats: &mut StorageStatsCounters) -> io::R
         }
     }
 
-    if crc32c_finish(crc) != expected_checksum {
+    if crc.value() != expected_checksum {
         stats.checksum_failed();
         return Err(invalid_data("segment record checksum mismatch"));
     }
@@ -2139,49 +2140,6 @@ fn decode_count(decoder: &mut Decoder<'_>, error: &'static str) -> io::Result<u3
         return Err(invalid_data(error));
     }
     Ok(value)
-}
-
-const CRC32C_POLYNOMIAL: u32 = 0x82F6_3B78;
-const CRC32C_TABLE: [u32; 256] = make_crc32c_table();
-
-const fn make_crc32c_table() -> [u32; 256] {
-    let mut table = [0; 256];
-    let mut i = 0;
-    while i < table.len() {
-        let mut crc = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = if crc & 1 == 0 {
-                crc >> 1
-            } else {
-                (crc >> 1) ^ CRC32C_POLYNOMIAL
-            };
-            bit += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-}
-
-fn crc32c(bytes: &[u8]) -> u32 {
-    crc32c_finish(crc32c_extend(crc32c_initial(), bytes))
-}
-
-fn crc32c_initial() -> u32 {
-    0xFFFF_FFFF
-}
-
-fn crc32c_extend(mut crc: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        let index = ((crc ^ u32::from(*byte)) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC32C_TABLE[index];
-    }
-    crc
-}
-
-fn crc32c_finish(crc: u32) -> u32 {
-    !crc
 }
 
 #[derive(Debug)]
