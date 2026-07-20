@@ -5,10 +5,10 @@ This document describes the current storage architecture of `sukari`.
 ## Key Characteristics
 
 `sukari` favors a simple runtime path: ordinary writes append records to shared
-segments, and full reads are mainly for startup or recovery. This should make
-typical Raft storage writes predictable. Recovery APIs read snapshots and
-retained log suffixes as whole values, so huge payloads and random-read log
-paging are out of scope.
+segments, and full reads are mainly for startup or recovery. This keeps typical
+Raft storage writes on an append-only path with storage-local validation.
+`load()` and `load_all()` read snapshots and retained log suffixes as whole
+values, so huge payloads and random-read log paging are out of scope.
 
 ## Scope
 
@@ -51,7 +51,8 @@ plane above the storage layer.
 
 ## Storage Layout
 
-The implementation uses one active shared append segment at a time:
+The implementation uses one active shared append segment at a time. A populated
+storage directory uses shared append segments plus small JSON metadata files:
 
 ```text
 storage/
@@ -82,7 +83,7 @@ writer:
 - save current term
 - save voted-for node
 - append log entries and command payloads
-- save snapshot state
+- save snapshot checkpoint
 - flush pending writes
 - load all non-removed node states
 - remove a node and reserve its node ID
@@ -94,6 +95,12 @@ cannot be created again.
 `sukari` does not add internal mutexes around writes. Callers that need
 concurrent runtime integration own serialization outside this crate, for example
 by routing storage requests through a dedicated storage task.
+
+`SyncPolicy` controls explicit durability. `Strict` synchronizes every storage
+record and metadata update. `Batch` synchronizes segment data after configured
+record or byte thresholds, while metadata replacements remain synchronized;
+`flush()` also synchronizes pending segment data. `UnsafeNoSync` skips explicit
+synchronization and leaves persistence timing to the operating system.
 
 Write operations append storage records as they are received. The storage layer
 validates record-local invariants, such as frame checksums and command payload
@@ -111,21 +118,8 @@ appropriate recovery action.
 Command payload tags are persisted and replayed without interpretation. Their
 meaning belongs to the caller.
 
-The on-disk segment record format is specified in
-[segment-format.md](segment-format.md).
-
-## Storage Directory Layout
-
-A populated storage directory uses shared append segments plus small JSON
-metadata files:
-
-```text
-storage/
-  nodes.json
-  checkpoints.json
-  append-0.segment
-  append-1.segment
-```
+The on-disk segment record format is specified in the
+[Segment Format](segment-format.md) document.
 
 ## Node Registry
 
@@ -138,11 +132,10 @@ storage/
   append-1.segment
 ```
 
-The registry records which `noraft::NodeId` values are valid for this storage
+The registry records which `noraft::NodeId` values belong to this storage
 instance. Nodes are added with `create_node()` and removed with `remove_node()`.
 Storage operations such as `load()`, `save_current_term()`, `save_voted_for()`,
-`append_entries()`, and `save_snapshot()` fail for node IDs that have not been
-created.
+`append_entries()`, and `save_snapshot()` fail for node IDs that are not active.
 
 `nodes.json` has this schema:
 
@@ -168,7 +161,8 @@ append a segment record.
 node visible in `nodes.json`. The initial checkpoint uses term zero, no vote, a
 zero-position snapshot with an empty payload, and an empty suffix. Its location
 is stored in `checkpoints.json`. This gives every normally created active node a
-checkpoint barrier without adding GC-specific fields to `nodes.json`.
+checkpoint barrier without adding garbage-collection-specific fields to
+`nodes.json`.
 
 Each node entry contains a typed `startup` flag and opaque JSON metadata. The
 `startup` flag means the node is considered during process startup before any
@@ -236,14 +230,15 @@ active.
 
 ## Replay
 
-Startup discovers `append-*.segment` files, replays them in deterministic
-file-name order, and rebuilds per-node state:
+`load()` and `load_all()` discover `append-*.segment` files when they need node
+state, replay them in deterministic append segment ID order, and rebuild
+per-node state:
 
 - current term
 - voted-for node
 - log entries
 - tagged command payloads
-- latest snapshot metadata and data or reference
+- latest snapshot metadata and payload
 
 The implementation does not require an on-disk random-read log index.
 Normal reads are expected to be rare and mostly limited to startup.
@@ -270,8 +265,8 @@ writes. Opening the engine may scan segment frames for recovery, but full
 the requested node state, while `load_all()` constructs all non-removed node
 states.
 
-The initial design assumes that the loaded snapshot payload and the log entries
-after that snapshot fit comfortably in memory. Payload bytes are stored in a
+The design assumes that the loaded snapshot payload and the log entries after
+that snapshot are sized for in-memory loading. Payload bytes are stored in a
 reference-counted `Bytes` wrapper so cloning loaded command and snapshot
 payloads is cheap, but the bytes themselves are still expected to fit in memory.
 This keeps the storage API simple and matches the expected Raft usage. Very
@@ -304,12 +299,13 @@ typed runtime snapshot of storage counters and gauges. Runtime integration
 crates can aggregate that snapshot with transport metrics, add deployment
 labels, and convert the result to Prometheus text or another scrape format.
 
-Metric names and labels belong at the runtime integration boundary. Exported
-names use a stable `sukari_` prefix and labels stay low-cardinality. Good
-dimensions include operation kind, record kind, sync policy, and error kind.
-Segment IDs, log indexes, request IDs, and stream IDs are not labels.
+Metric names and labels belong at the runtime integration boundary. If an
+integration exports these stats, it should use a crate-specific prefix such as
+`sukari_` and keep labels low-cardinality. Useful dimensions include operation
+kind, record kind, sync policy, and error kind. Segment IDs, log indexes,
+request IDs, and stream IDs are not labels.
 
-## Compaction And Garbage Collection
+## Compaction and Garbage Collection
 
 Garbage collection is the main complexity of shared storage.
 
@@ -332,8 +328,8 @@ each active node an initial checkpoint barrier. Removed nodes do not participate
 in the minimum barrier calculation. If no active nodes remain, GC may delete all
 inactive append segments.
 
-The implementation stores latest checkpoint locations in a separate
-authoritative JSON file, `checkpoints.json`:
+The implementation stores checkpoint index entries in a separate JSON file,
+`checkpoints.json`:
 
 ```json
 {
@@ -351,13 +347,16 @@ authoritative JSON file, `checkpoints.json`:
 }
 ```
 
-`checkpoints.json` is authoritative for deletion decisions and useful as a
-replay hint. If `checkpoints.json` is missing, the engine behaves as if no
-checkpoint barriers exist. If it exists but is malformed, violates the schema,
-names a non-append segment, points at a non-existent segment, or points at an
-offset that is not a checkpoint record for the target node, opening the engine
-fails with `InvalidData`. Well-formed entries for removed or unknown nodes are
-ignored on open, and `remove_node()` removes the node from the checkpoint index.
+`checkpoints.json` is authoritative for deletion decisions: GC uses only
+barriers recorded in this file. It is also a replay hint. A crash can leave the
+index stale, so a recorded checkpoint may be older than the latest checkpoint
+record in the segment stream. If `checkpoints.json` is missing, the engine
+behaves as if no checkpoint barriers exist. If it exists but is malformed,
+violates the schema, names a non-append segment, points at a non-existent
+segment, or points at an offset that is not a checkpoint record for the target
+node, opening the engine fails with `InvalidData`. Well-formed entries for
+removed or unknown nodes are ignored on open, and `remove_node()` removes the
+node from the checkpoint index.
 
 `checkpoints.json` is updated by atomic replacement. A checkpoint update appends
 and durably syncs the checkpoint record first when the sync policy requires it.

@@ -17,9 +17,10 @@ small storage container beside a raft.
 `sukari` uses `noraft` protocol types directly and owns the shared storage
 format, replay, checkpoints, and whole-segment garbage collection. It favors a
 simple runtime path: ordinary writes append records to shared segments, and full
-reads are mainly for startup or recovery. This should make typical Raft storage
-writes predictable. Recovery APIs read snapshots and retained log suffixes as
-whole values, so huge payloads and random-read log paging are out of scope.
+reads are mainly for startup or recovery. This keeps typical Raft storage writes
+on an append-only path with storage-local validation. `load()` and `load_all()`
+read snapshots and retained log suffixes as whole values, so huge payloads and
+random-read log paging are out of scope.
 
 ## Example
 
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join("sukari-readme-example");
     let _ = std::fs::remove_dir_all(&dir);
 
-    // Open one storage directory with strict durability for each write.
+    // Open one storage directory and synchronize every durable update.
     let mut storage = StorageEngine::new(&dir, SyncPolicy::Strict)?;
     let node_id = noraft::NodeId::new(1);
 
@@ -82,6 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 internal mutexes around writes; runtimes that need concurrent access serialize
 storage requests outside this crate.
 
+`SyncPolicy` controls explicit durability. `Strict` synchronizes every storage
+record and metadata update. `Batch` synchronizes segment data after configured
+record or byte thresholds, while metadata replacements remain synchronized;
+`flush()` also synchronizes pending segment data. `UnsafeNoSync` skips explicit
+synchronization and leaves persistence timing to the operating system.
+
 Node IDs must be created with `create_node()` before node state can be written
 or loaded. Removed node IDs remain reserved. Writes are appended as received:
 the storage layer validates record-local invariants, but it does not load the
@@ -97,10 +104,12 @@ voted-for node, latest snapshot, and retained log suffix. Earlier records for
 the node become obsolete for replay and whole-segment garbage collection.
 
 `load()` and `load_all()` construct `NodeState` values on demand. The design
-assumes that the loaded snapshot payload and retained log suffix fit comfortably
-in memory.
+assumes that the loaded snapshot payload and retained log suffix are sized for
+in-memory loading.
 
 ## Documents
 
-- [Architecture overview](docs/architecture-overview.md)
-- [Segment format](docs/segment-format.md)
+- [Architecture Overview](docs/architecture-overview.md) explains the storage
+  model, node registry, checkpoints, replay, metrics, and garbage collection.
+- [Segment Format](docs/segment-format.md) specifies the on-disk segment record
+  format.

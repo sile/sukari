@@ -1,8 +1,9 @@
 # Segment Format
 
-This document specifies the current `sukari` segment record format.
+This document specifies the `sukari` segment record format.
 
-The current segment magic is `SKR1`.
+The supported segment magic is `SKR1`. Readers reject segment files with any
+other file-level magic.
 
 ## Segment Layout
 
@@ -58,11 +59,10 @@ The current term payload is:
 
 ## Voted-For Node
 
-The voted-for payload uses the common optional node ID encoding:
+The voted-for payload is an `OptionalNode`:
 
 ```text
-1 byte   0 for none, 1 for some
-8 bytes  node_id as u64, only when the tag is 1
+OptionalNode  voted-for node
 ```
 
 ## Log Append
@@ -107,7 +107,7 @@ A snapshot checkpoint payload is:
 
 ```text
 8 bytes       current term as u64
-OptionalNode  voted-for node, using the same optional node ID encoding
+OptionalNode  voted-for node
 Snapshot
 LogAppend     retained suffix after the snapshot
 ```
@@ -135,6 +135,13 @@ Bytes          snapshot payload
 NodeIdSet  voters
 NodeIdSet  new_voters
 NodeIdSet  non_voters
+```
+
+`OptionalNode` encodes an optional node ID:
+
+```text
+1 byte   presence flag: 0 for none, 1 for some
+8 bytes  node_id as u64, only when the presence flag is 1
 ```
 
 Each node ID set is encoded in ascending node ID order:
