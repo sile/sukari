@@ -1,34 +1,32 @@
 //! Shared segmented storage model for Raft node state.
 
 use crate::bytes::Bytes;
-use crate::crc32c::{Crc32c, crc32c};
+use crate::codec::{
+    decode_node_record, decode_record_node_id, frame_len_from_body, read_record_body,
+    scan_record_frame,
+};
+use crate::error::{invalid_data, invalid_input, invalid_json, usize_to_u64};
 use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_removed_error};
+use crate::segment::{
+    RecordPosition, SEGMENT_FILE_HEADER_LEN_U64, SegmentName, SegmentPath, SegmentWriter,
+    discover_segment_paths, read_segment_header, segment_file_exists, select_active_append_segment,
+};
 use crate::stats::{
     NodeAccessErrorKind, RecordKindMetric, StorageOperationKind, StorageStats, StorageStatsCounters,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     fmt,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-const SEGMENT_FORMAT_MAGIC: &[u8; 4] = b"SKR1";
-const SEGMENT_FILE_HEADER_LEN: usize = 4;
-const SEGMENT_FILE_HEADER_LEN_U64: u64 = SEGMENT_FILE_HEADER_LEN as u64;
-const SEGMENT_RECORD_BASE_HEADER_LEN: usize = 4;
-const SEGMENT_CHECKSUM_LEN: usize = 4;
-const SEGMENT_RECORD_HEADER_LEN: usize = SEGMENT_RECORD_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
-const SEGMENT_FILE_SUFFIX: &str = ".segment";
 const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
 const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
-const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
-const MAX_COUNT_ITEMS: u32 = 1_000_000;
 
 /// Storage synchronization policy for segment data and metadata files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +175,7 @@ impl StorageEngine {
         let checkpoint_position = self.checkpoint_index.checkpoint_position(node_id);
         replay_node_state(
             &self.dir,
-            self.writer.active_segment,
+            self.writer.active_segment(),
             node_id,
             checkpoint_position,
             &mut self.stats,
@@ -198,7 +196,7 @@ impl StorageEngine {
         let checkpoint_hints = self.checkpoint_index.checkpoint_positions(&active_node_ids);
         let mut replay = replay_storage_dir(
             &self.dir,
-            self.writer.active_segment,
+            self.writer.active_segment(),
             Some(&active_node_ids),
             checkpoint_hints,
             &mut self.stats,
@@ -323,10 +321,10 @@ impl StorageEngine {
         stats.active_nodes = usize_to_u64(self.registry.active_node_count());
         stats.removed_nodes = usize_to_u64(self.registry.removed_node_count());
         stats.checkpoint_index_nodes = usize_to_u64(self.checkpoint_index.len());
-        stats.active_append_segment_id = self.writer.active_segment.id.get();
-        stats.active_append_segment_len_bytes = self.writer.segment_len;
-        stats.unsynced_records = usize_to_u64(self.writer.unsynced_records);
-        stats.unsynced_bytes = self.writer.unsynced_bytes;
+        stats.active_append_segment_id = self.writer.active_segment().id();
+        stats.active_append_segment_len_bytes = self.writer.segment_len();
+        stats.unsynced_records = usize_to_u64(self.writer.unsynced_records());
+        stats.unsynced_bytes = self.writer.unsynced_bytes();
         stats
     }
 
@@ -368,7 +366,7 @@ impl StorageEngine {
 
         let mut deleted_segments = 0;
         for segment in discover_segment_paths(&self.dir)? {
-            if segment.name == self.writer.active_segment {
+            if segment.name == self.writer.active_segment() {
                 continue;
             }
             if !barrier.allows_delete(segment.name) {
@@ -387,139 +385,6 @@ impl StorageEngine {
         }
         if deleted_segments != 0 && should_sync_metadata(self.sync) {
             sync_dir(&self.dir)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct SegmentWriter {
-    dir: PathBuf,
-    active_segment: SegmentName,
-    file: File,
-    sync: SyncPolicy,
-    segment_len: u64,
-    max_segment_len: u64,
-    unsynced_records: usize,
-    unsynced_bytes: u64,
-}
-
-impl SegmentWriter {
-    fn open(
-        dir: &Path,
-        sync: SyncPolicy,
-        active_segment: SegmentName,
-        max_segment_len: u64,
-    ) -> io::Result<Self> {
-        let segment_path = active_segment.path(dir);
-        let file_existed = segment_path.exists();
-        let mut file = open_active_segment_file(&segment_path)?;
-        if !file_existed && should_sync_metadata(sync) {
-            sync_parent_dir(&segment_path)?;
-        }
-        let segment_len = file.seek(SeekFrom::End(0))?;
-
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            active_segment,
-            file,
-            sync,
-            segment_len,
-            max_segment_len,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
-        })
-    }
-
-    fn append(
-        &mut self,
-        node_id: noraft::NodeId,
-        record: &Record,
-        stats: &mut StorageStatsCounters,
-    ) -> io::Result<RecordPosition> {
-        let frame = encode_record_frame(node_id, record)?;
-        let written_bytes =
-            u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
-        if self.should_rotate(written_bytes) {
-            self.rotate(stats)?;
-        }
-        let record_position = RecordPosition {
-            segment: self.active_segment,
-            offset: self.segment_len,
-        };
-        self.file.write_all(&frame)?;
-        self.segment_len = self
-            .segment_len
-            .checked_add(written_bytes)
-            .ok_or_else(|| invalid_data("segment length overflow"))?;
-        stats.record_written(record.metric_kind(), written_bytes);
-        self.after_write(written_bytes, stats)?;
-        Ok(record_position)
-    }
-
-    fn should_rotate(&self, written_bytes: u64) -> bool {
-        if self.segment_len <= SEGMENT_FILE_HEADER_LEN_U64 {
-            return false;
-        }
-        self.segment_len
-            .checked_add(written_bytes)
-            .is_none_or(|len| self.max_segment_len < len)
-    }
-
-    fn rotate(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        self.flush(stats)?;
-        let next_segment = self.active_segment.next_append()?;
-        let segment_path = next_segment.path(&self.dir);
-        let file = create_active_segment_file(&segment_path)?;
-        if should_sync_metadata(self.sync) {
-            sync_parent_dir(&segment_path)?;
-        }
-
-        self.active_segment = next_segment;
-        self.file = file;
-        self.segment_len = SEGMENT_FILE_HEADER_LEN_U64;
-        self.unsynced_records = 0;
-        self.unsynced_bytes = 0;
-        stats.segment_rotated();
-        Ok(())
-    }
-
-    fn after_write(
-        &mut self,
-        written_bytes: u64,
-        stats: &mut StorageStatsCounters,
-    ) -> io::Result<()> {
-        match self.sync {
-            SyncPolicy::Strict => self.sync_data(stats),
-            SyncPolicy::Batch {
-                max_records,
-                max_bytes,
-            } => {
-                self.unsynced_records += 1;
-                self.unsynced_bytes += written_bytes;
-                let records_reached = max_records != 0 && max_records <= self.unsynced_records;
-                let bytes_reached = max_bytes != 0 && max_bytes <= self.unsynced_bytes;
-                if records_reached || bytes_reached {
-                    self.sync_data(stats)?;
-                }
-                Ok(())
-            }
-            SyncPolicy::UnsafeNoSync => Ok(()),
-        }
-    }
-
-    fn sync_data(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        self.file.sync_data()?;
-        self.unsynced_records = 0;
-        self.unsynced_bytes = 0;
-        stats.durable_synced();
-        Ok(())
-    }
-
-    fn flush(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        match self.sync {
-            SyncPolicy::UnsafeNoSync => {}
-            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(stats)?,
         }
         Ok(())
     }
@@ -596,7 +461,7 @@ impl LogAppend {
         &self.command_payloads
     }
 
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         for (position, entry) in self.entries.iter_with_positions() {
             if entry == noraft::LogEntry::Command
                 && !self.command_payloads.contains_key(&position.index)
@@ -656,7 +521,7 @@ pub struct SnapshotCheckpoint {
 }
 
 impl SnapshotCheckpoint {
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         self.suffix.validate()?;
         if self.suffix.entries.prev_position() != self.snapshot.last_included {
             return Err(invalid_input(
@@ -793,7 +658,7 @@ impl NodeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Record {
+pub(crate) enum Record {
     CurrentTerm(noraft::Term),
     VotedFor(Option<noraft::NodeId>),
     Append(LogAppend),
@@ -801,7 +666,7 @@ enum Record {
 }
 
 impl Record {
-    fn metric_kind(&self) -> RecordKindMetric {
+    pub(crate) fn metric_kind(&self) -> RecordKindMetric {
         match self {
             Self::CurrentTerm(_) => RecordKindMetric::CurrentTerm,
             Self::VotedFor(_) => RecordKindMetric::VotedFor,
@@ -812,102 +677,9 @@ impl Record {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NodeRecord {
-    node_id: noraft::NodeId,
-    record: Record,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SegmentId(u64);
-
-impl SegmentId {
-    const FIRST: Self = Self(0);
-
-    fn get(self) -> u64 {
-        self.0
-    }
-
-    fn next(self) -> io::Result<Self> {
-        let id = self
-            .0
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("segment ID overflow"))?;
-        Ok(Self(id))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SegmentName {
-    id: SegmentId,
-}
-
-impl SegmentName {
-    fn first_append() -> Self {
-        Self {
-            id: SegmentId::FIRST,
-        }
-    }
-
-    fn next_append(self) -> io::Result<Self> {
-        Ok(Self {
-            id: self.id.next()?,
-        })
-    }
-
-    fn parse_file_name(file_name: &OsStr) -> Option<Self> {
-        let file_name = file_name.to_str()?;
-        let id = file_name
-            .strip_prefix("append-")?
-            .strip_suffix(SEGMENT_FILE_SUFFIX)?;
-        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        if id.len() > 1 && id.starts_with('0') {
-            return None;
-        }
-        let id = SegmentId(id.parse().ok()?);
-        Some(Self { id })
-    }
-
-    fn parse_str(s: &str) -> Option<Self> {
-        Self::parse_file_name(OsStr::new(s))
-    }
-
-    fn path(self, dir: &Path) -> PathBuf {
-        dir.join(self.file_name())
-    }
-
-    fn file_name(self) -> String {
-        format!("append-{}{}", self.id.get(), SEGMENT_FILE_SUFFIX)
-    }
-}
-
-fn select_active_append_segment(dir: &Path) -> io::Result<SegmentName> {
-    Ok(discover_segment_paths(dir)?
-        .into_iter()
-        .map(|segment| segment.name)
-        .max()
-        .unwrap_or_else(SegmentName::first_append))
-}
-
-fn segment_file_exists(dir: &Path, name: SegmentName) -> io::Result<bool> {
-    match std::fs::metadata(name.path(dir)) {
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-#[derive(Debug)]
-struct SegmentPath {
-    name: SegmentName,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RecordPosition {
-    segment: SegmentName,
-    offset: u64,
+pub(crate) struct NodeRecord {
+    pub(crate) node_id: noraft::NodeId,
+    pub(crate) record: Record,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1292,31 +1064,6 @@ fn recover_storage_dir(
     Ok(())
 }
 
-fn discover_segment_paths(dir: &Path) -> io::Result<Vec<SegmentPath>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Some(name) = SegmentName::parse_file_name(&entry.file_name()) else {
-            continue;
-        };
-        paths.push(SegmentPath {
-            name,
-            path: entry.path(),
-        });
-    }
-    paths.sort_by_key(|segment| segment.name);
-    Ok(paths)
-}
-
 fn find_checkpoint_positions(
     dir: &Path,
     active_segment: SegmentName,
@@ -1552,106 +1299,7 @@ fn scan_segment(
     Ok(())
 }
 
-fn read_segment_header(
-    file: &mut File,
-    allow_partial: bool,
-    stats: Option<&mut StorageStatsCounters>,
-) -> io::Result<bool> {
-    file.seek(SeekFrom::Start(0))?;
-    let file_len = file.metadata()?.len();
-    if file_len == 0 {
-        if allow_partial {
-            return Ok(false);
-        }
-        return Err(invalid_data("missing segment header"));
-    }
-    if file_len < SEGMENT_FILE_HEADER_LEN_U64 {
-        if allow_partial {
-            if let Some(stats) = stats {
-                stats.replay_truncated();
-            }
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            return Ok(false);
-        }
-        return Err(invalid_data("partial segment header in inactive segment"));
-    }
-
-    let mut magic = [0; SEGMENT_FILE_HEADER_LEN];
-    file.read_exact(&mut magic)?;
-    if &magic != SEGMENT_FORMAT_MAGIC {
-        return Err(invalid_data("unsupported segment format"));
-    }
-    Ok(true)
-}
-
-fn scan_record_frame(file: &mut File, stats: &mut StorageStatsCounters) -> io::Result<Option<()>> {
-    let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
-    match file.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    let body_len = u32::from_le_bytes(header);
-    if MAX_RECORD_BODY_LEN < body_len {
-        return Err(invalid_data("segment record is too large"));
-    }
-
-    let mut checksum = [0; SEGMENT_CHECKSUM_LEN];
-    match file.read_exact(&mut checksum) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let expected_checksum = u32::from_le_bytes(checksum);
-
-    let mut crc = Crc32c::new();
-    let mut remaining = u64::from(body_len);
-    let mut buffer = [0; 8192];
-    while remaining != 0 {
-        let read_len = remaining.min(buffer.len() as u64) as usize;
-        match file.read_exact(&mut buffer[..read_len]) {
-            Ok(()) => {
-                crc.update(&buffer[..read_len]);
-                remaining -= read_len as u64;
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-    }
-
-    if crc.value() != expected_checksum {
-        stats.checksum_failed();
-        return Err(invalid_data("segment record checksum mismatch"));
-    }
-
-    Ok(Some(()))
-}
-
-fn open_active_segment_file(path: &Path) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)?;
-    if file.metadata()?.len() == 0 {
-        file.write_all(SEGMENT_FORMAT_MAGIC)?;
-    }
-    Ok(file)
-}
-
-fn create_active_segment_file(path: &Path) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(SEGMENT_FORMAT_MAGIC)?;
-    Ok(file)
-}
-
-fn should_sync_metadata(sync: SyncPolicy) -> bool {
+pub(crate) fn should_sync_metadata(sync: SyncPolicy) -> bool {
     !matches!(sync, SyncPolicy::UnsafeNoSync)
 }
 
@@ -1664,7 +1312,7 @@ fn create_dir_all_synced(path: &Path, sync: SyncPolicy) -> io::Result<()> {
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -1676,523 +1324,4 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 
 fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
-}
-
-fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<Vec<u8>> {
-    let mut body = Encoder::new();
-    encode_node_id(node_id, &mut body)?;
-    encode_record(record, &mut body)?;
-    let body = body.finish();
-
-    let body_len = u32::try_from(body.len()).map_err(|_| invalid_input("record is too large"))?;
-    if MAX_RECORD_BODY_LEN < body_len {
-        return Err(invalid_input("record is too large"));
-    }
-
-    let mut frame = Vec::new();
-    frame.extend_from_slice(&body_len.to_le_bytes());
-    frame.extend_from_slice(&crc32c(&body).to_le_bytes());
-    debug_assert_eq!(frame.len(), SEGMENT_RECORD_HEADER_LEN);
-    frame.extend_from_slice(&body);
-    Ok(frame)
-}
-
-fn read_record_body(
-    file: &mut File,
-    stats: Option<&mut StorageStatsCounters>,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
-    match file.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    let body_len = u32::from_le_bytes(header);
-    if MAX_RECORD_BODY_LEN < body_len {
-        return Err(invalid_data("segment record is too large"));
-    }
-
-    let mut checksum = [0; SEGMENT_CHECKSUM_LEN];
-    match file.read_exact(&mut checksum) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let expected_checksum = u32::from_le_bytes(checksum);
-
-    let mut body = Vec::new();
-    let mut reader = file.take(u64::from(body_len));
-    reader.read_to_end(&mut body)?;
-    if body.len() != body_len as usize {
-        return Ok(None);
-    }
-
-    let actual_checksum = crc32c(&body);
-    if actual_checksum != expected_checksum {
-        if let Some(stats) = stats {
-            stats.checksum_failed();
-        }
-        return Err(invalid_data("segment record checksum mismatch"));
-    }
-    Ok(Some(body))
-}
-
-fn frame_len_from_body(body: &[u8]) -> io::Result<u64> {
-    u64::try_from(SEGMENT_RECORD_HEADER_LEN + body.len())
-        .map_err(|_| invalid_data("segment frame length overflow"))
-}
-
-fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
-    match record {
-        Record::CurrentTerm(term) => {
-            encoder.put_u8(0)?;
-            encode_term(*term, encoder)?;
-        }
-        Record::VotedFor(voted_for) => {
-            encoder.put_u8(1)?;
-            encode_optional_node_id(*voted_for, encoder)?;
-        }
-        Record::Append(append) => {
-            encoder.put_u8(2)?;
-            encode_log_append(append, encoder)?;
-        }
-        Record::SnapshotCheckpoint(checkpoint) => {
-            encoder.put_u8(3)?;
-            encode_snapshot_checkpoint(checkpoint, encoder)?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_node_record(bytes: &[u8]) -> io::Result<NodeRecord> {
-    let mut decoder = Decoder::new(bytes);
-    let node_id = decode_node_id(&mut decoder)?;
-    let record = match decoder.get_u8()? {
-        0 => Record::CurrentTerm(decode_term(&mut decoder)?),
-        1 => Record::VotedFor(decode_optional_node_id(&mut decoder)?),
-        2 => Record::Append(decode_log_append(&mut decoder)?),
-        3 => Record::SnapshotCheckpoint(decode_snapshot_checkpoint(&mut decoder)?),
-        _ => return Err(invalid_data("unknown segment record tag")),
-    };
-    decoder.finish()?;
-    Ok(NodeRecord { node_id, record })
-}
-
-fn decode_record_node_id(bytes: &[u8]) -> io::Result<noraft::NodeId> {
-    let mut decoder = Decoder::new(bytes);
-    decode_node_id(&mut decoder)
-}
-
-fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()> {
-    append.validate()?;
-    encode_log_entries(&append.entries, encoder)?;
-    encode_count(
-        append.command_payloads.len(),
-        "too many command payloads",
-        encoder,
-    )?;
-    for (index, payload) in &append.command_payloads {
-        encode_log_index(*index, encoder)?;
-        encoder.put_u8(payload.tag())?;
-        encoder.put_bytes(payload.bytes().as_slice())?;
-    }
-    Ok(())
-}
-
-fn decode_log_append(decoder: &mut Decoder<'_>) -> io::Result<LogAppend> {
-    let entries = decode_log_entries(decoder)?;
-    let command_count = decode_count(decoder, "too many command payloads")?;
-
-    let mut command_payloads = BTreeMap::new();
-    for _ in 0..command_count {
-        let index = decode_log_index(decoder)?;
-        let tag = decoder.get_u8()?;
-        let payload = CommandPayload::new(tag, Bytes::from(decoder.get_bytes()?));
-        if command_payloads.insert(index, payload).is_some() {
-            return Err(invalid_data("duplicate command payload index"));
-        }
-    }
-
-    LogAppend::new(entries, command_payloads)
-        .map_err(|_| invalid_data("invalid command payload mapping"))
-}
-
-fn encode_snapshot(snapshot: &Snapshot, encoder: &mut Encoder) -> io::Result<()> {
-    encode_log_position(snapshot.last_included, encoder)?;
-    encode_cluster_config(&snapshot.config, encoder)?;
-    encoder.put_bytes(snapshot.data.as_slice())
-}
-
-fn decode_snapshot(decoder: &mut Decoder<'_>) -> io::Result<Snapshot> {
-    Ok(Snapshot {
-        last_included: decode_log_position(decoder)?,
-        config: decode_cluster_config(decoder)?,
-        data: Bytes::from(decoder.get_bytes()?),
-    })
-}
-
-fn encode_snapshot_checkpoint(
-    checkpoint: &SnapshotCheckpoint,
-    encoder: &mut Encoder,
-) -> io::Result<()> {
-    checkpoint.validate()?;
-    encode_term(checkpoint.current_term, encoder)?;
-    encode_optional_node_id(checkpoint.voted_for, encoder)?;
-    encode_snapshot(&checkpoint.snapshot, encoder)?;
-    encode_log_append(&checkpoint.suffix, encoder)
-}
-
-fn decode_snapshot_checkpoint(decoder: &mut Decoder<'_>) -> io::Result<SnapshotCheckpoint> {
-    let checkpoint = SnapshotCheckpoint {
-        current_term: decode_term(decoder)?,
-        voted_for: decode_optional_node_id(decoder)?,
-        snapshot: decode_snapshot(decoder)?,
-        suffix: decode_log_append(decoder)?,
-    };
-    checkpoint
-        .validate()
-        .map_err(|_| invalid_data("invalid snapshot checkpoint"))?;
-    Ok(checkpoint)
-}
-
-fn encode_log_entries(entries: &noraft::LogEntries, encoder: &mut Encoder) -> io::Result<()> {
-    encode_log_position(entries.prev_position(), encoder)?;
-    encode_count(entries.len(), "too many log entries", encoder)?;
-    for entry in entries.iter() {
-        encode_log_entry(&entry, encoder)?;
-    }
-    Ok(())
-}
-
-fn decode_log_entries(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogEntries> {
-    let prev_position = decode_log_position(decoder)?;
-    let len = decode_count(decoder, "too many log entries")?;
-
-    let mut entries = noraft::LogEntries::new(prev_position);
-    for _ in 0..len {
-        entries.push(decode_log_entry(decoder)?);
-    }
-    Ok(entries)
-}
-
-fn encode_log_entry(entry: &noraft::LogEntry, encoder: &mut Encoder) -> io::Result<()> {
-    match entry {
-        noraft::LogEntry::Term(term) => {
-            encoder.put_u8(0)?;
-            encode_term(*term, encoder)?;
-        }
-        noraft::LogEntry::ClusterConfig(config) => {
-            encoder.put_u8(1)?;
-            encode_cluster_config(config, encoder)?;
-        }
-        noraft::LogEntry::Command => encoder.put_u8(2)?,
-    }
-    Ok(())
-}
-
-fn decode_log_entry(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogEntry> {
-    match decoder.get_u8()? {
-        0 => Ok(noraft::LogEntry::Term(decode_term(decoder)?)),
-        1 => Ok(noraft::LogEntry::ClusterConfig(decode_cluster_config(
-            decoder,
-        )?)),
-        2 => Ok(noraft::LogEntry::Command),
-        _ => Err(invalid_data("unknown log entry tag")),
-    }
-}
-
-fn encode_cluster_config(config: &noraft::ClusterConfig, encoder: &mut Encoder) -> io::Result<()> {
-    encode_node_id_set(&config.voters, encoder)?;
-    encode_node_id_set(&config.new_voters, encoder)?;
-    encode_node_id_set(&config.non_voters, encoder)
-}
-
-fn decode_cluster_config(decoder: &mut Decoder<'_>) -> io::Result<noraft::ClusterConfig> {
-    Ok(noraft::ClusterConfig {
-        voters: decode_node_id_set(decoder)?,
-        new_voters: decode_node_id_set(decoder)?,
-        non_voters: decode_node_id_set(decoder)?,
-    })
-}
-
-fn encode_node_id_set(
-    nodes: &std::collections::BTreeSet<noraft::NodeId>,
-    encoder: &mut Encoder,
-) -> io::Result<()> {
-    encode_count(nodes.len(), "too many node IDs", encoder)?;
-    for node in nodes {
-        encode_node_id(*node, encoder)?;
-    }
-    Ok(())
-}
-
-fn decode_node_id_set(
-    decoder: &mut Decoder<'_>,
-) -> io::Result<std::collections::BTreeSet<noraft::NodeId>> {
-    let len = decode_count(decoder, "too many node IDs")?;
-
-    let mut nodes = std::collections::BTreeSet::new();
-    for _ in 0..len {
-        if !nodes.insert(decode_node_id(decoder)?) {
-            return Err(invalid_data("duplicate node ID"));
-        }
-    }
-    Ok(nodes)
-}
-
-fn encode_optional_node_id(
-    node_id: Option<noraft::NodeId>,
-    encoder: &mut Encoder,
-) -> io::Result<()> {
-    match node_id {
-        Some(node_id) => {
-            encoder.put_u8(1)?;
-            encode_node_id(node_id, encoder)?;
-        }
-        None => encoder.put_u8(0)?,
-    }
-    Ok(())
-}
-
-fn decode_optional_node_id(decoder: &mut Decoder<'_>) -> io::Result<Option<noraft::NodeId>> {
-    match decoder.get_u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(decode_node_id(decoder)?)),
-        _ => Err(invalid_data("invalid optional node ID tag")),
-    }
-}
-
-fn encode_log_position(position: noraft::LogPosition, encoder: &mut Encoder) -> io::Result<()> {
-    encode_term(position.term, encoder)?;
-    encode_log_index(position.index, encoder)
-}
-
-fn decode_log_position(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogPosition> {
-    Ok(noraft::LogPosition {
-        term: decode_term(decoder)?,
-        index: decode_log_index(decoder)?,
-    })
-}
-
-fn encode_term(term: noraft::Term, encoder: &mut Encoder) -> io::Result<()> {
-    encoder.put_u64(term.get())
-}
-
-fn decode_term(decoder: &mut Decoder<'_>) -> io::Result<noraft::Term> {
-    Ok(noraft::Term::new(decoder.get_u64()?))
-}
-
-fn encode_node_id(node_id: noraft::NodeId, encoder: &mut Encoder) -> io::Result<()> {
-    encoder.put_u64(node_id.get())
-}
-
-fn decode_node_id(decoder: &mut Decoder<'_>) -> io::Result<noraft::NodeId> {
-    Ok(noraft::NodeId::new(decoder.get_u64()?))
-}
-
-fn encode_log_index(index: noraft::LogIndex, encoder: &mut Encoder) -> io::Result<()> {
-    encoder.put_u64(index.get())
-}
-
-fn decode_log_index(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogIndex> {
-    Ok(noraft::LogIndex::new(decoder.get_u64()?))
-}
-
-fn encode_count(value: usize, error: &'static str, encoder: &mut Encoder) -> io::Result<()> {
-    let value = u32::try_from(value).map_err(|_| invalid_input(error))?;
-    if MAX_COUNT_ITEMS < value {
-        return Err(invalid_input(error));
-    }
-    encoder.put_u32(value)
-}
-
-fn decode_count(decoder: &mut Decoder<'_>, error: &'static str) -> io::Result<u32> {
-    let value = decoder.get_u32()?;
-    if MAX_COUNT_ITEMS < value {
-        return Err(invalid_data(error));
-    }
-    Ok(value)
-}
-
-#[derive(Debug)]
-struct Encoder {
-    bytes: Vec<u8>,
-    len: u32,
-}
-
-impl Encoder {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            len: 0,
-        }
-    }
-
-    fn put_u8(&mut self, value: u8) -> io::Result<()> {
-        self.put_slice(&[value])
-    }
-
-    fn put_u32(&mut self, value: u32) -> io::Result<()> {
-        self.put_slice(&value.to_le_bytes())
-    }
-
-    fn put_u64(&mut self, value: u64) -> io::Result<()> {
-        self.put_slice(&value.to_le_bytes())
-    }
-
-    fn put_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let len =
-            u32::try_from(bytes.len()).map_err(|_| invalid_input("byte slice is too large"))?;
-        if MAX_RECORD_BODY_LEN < len {
-            return Err(invalid_input("byte slice is too large"));
-        }
-        let additional = 4usize
-            .checked_add(bytes.len())
-            .ok_or_else(|| invalid_input("record is too large"))?;
-        let new_len = self.check_append_len(additional)?;
-        self.bytes.extend_from_slice(&len.to_le_bytes());
-        self.bytes.extend_from_slice(bytes);
-        self.len = new_len;
-        Ok(())
-    }
-
-    fn put_slice(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.len = self.check_append_len(bytes.len())?;
-        self.bytes.extend_from_slice(bytes);
-        Ok(())
-    }
-
-    fn check_append_len(&self, additional: usize) -> io::Result<u32> {
-        let additional =
-            u32::try_from(additional).map_err(|_| invalid_input("record is too large"))?;
-        let len = self
-            .len
-            .checked_add(additional)
-            .ok_or_else(|| invalid_input("record is too large"))?;
-        if MAX_RECORD_BODY_LEN < len {
-            return Err(invalid_input("record is too large"));
-        }
-        Ok(len)
-    }
-
-    fn finish(self) -> Vec<u8> {
-        debug_assert_eq!(self.bytes.len(), self.len as usize);
-        self.bytes
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encoder_rejects_record_body_limit_before_integer_write() {
-        let mut encoder = encoder_with_len_for_test(MAX_RECORD_BODY_LEN);
-
-        let err = encoder
-            .put_u8(0)
-            .expect_err("integer write should exceed the record body limit");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(encoder.bytes.is_empty());
-        assert_eq!(encoder.len, MAX_RECORD_BODY_LEN);
-    }
-
-    #[test]
-    fn encoder_rejects_record_body_limit_before_byte_write() {
-        let mut encoder = encoder_with_len_for_test(MAX_RECORD_BODY_LEN - 3);
-
-        let err = encoder
-            .put_bytes(&[])
-            .expect_err("byte length prefix should exceed the record body limit");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(encoder.bytes.is_empty());
-        assert_eq!(encoder.len, MAX_RECORD_BODY_LEN - 3);
-    }
-
-    fn encoder_with_len_for_test(len: u32) -> Encoder {
-        Encoder {
-            bytes: Vec::new(),
-            len,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn get_u8(&mut self) -> io::Result<u8> {
-        let bytes = self.take(1)?;
-        Ok(bytes[0])
-    }
-
-    fn get_u32(&mut self) -> io::Result<u32> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("u32 encoding should be four bytes"),
-        ))
-    }
-
-    fn get_u64(&mut self) -> io::Result<u64> {
-        let bytes = self.take(8)?;
-        Ok(u64::from_le_bytes(
-            bytes
-                .try_into()
-                .expect("u64 encoding should be eight bytes"),
-        ))
-    }
-
-    fn get_bytes(&mut self) -> io::Result<&'a [u8]> {
-        let len = self.get_u32()?;
-        if MAX_RECORD_BODY_LEN < len {
-            return Err(invalid_data("byte slice is too large"));
-        }
-        let len = usize::try_from(len).map_err(|_| invalid_data("byte slice is too large"))?;
-        self.take(len)
-    }
-
-    fn take(&mut self, len: usize) -> io::Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(len)
-            .ok_or_else(|| invalid_data("record offset overflow"))?;
-        if self.bytes.len() < end {
-            return Err(invalid_data("record is too short"));
-        }
-        let slice = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(slice)
-    }
-
-    fn finish(&self) -> io::Result<()> {
-        if self.position == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(invalid_data("record has trailing bytes"))
-        }
-    }
-}
-
-fn invalid_input(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn invalid_json(error: nojson::JsonParseError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).expect("usize value should fit in u64")
 }

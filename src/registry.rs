@@ -1,5 +1,6 @@
 //! Node registry metadata.
 
+use crate::error::invalid_json;
 use crate::storage::SyncPolicy;
 
 use std::{
@@ -279,8 +280,4 @@ fn node_already_exists_error() -> io::Error {
         io::ErrorKind::AlreadyExists,
         "node storage has already been created",
     )
-}
-
-fn invalid_json(error: nojson::JsonParseError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
 }
