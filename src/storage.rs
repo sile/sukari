@@ -16,9 +16,11 @@ use std::{
 };
 
 const SEGMENT_FORMAT_MAGIC: &[u8; 4] = b"SKR1";
-const SEGMENT_BASE_HEADER_LEN: usize = 8;
+const SEGMENT_FILE_HEADER_LEN: usize = 4;
+const SEGMENT_FILE_HEADER_LEN_U64: u64 = SEGMENT_FILE_HEADER_LEN as u64;
+const SEGMENT_RECORD_BASE_HEADER_LEN: usize = 4;
 const SEGMENT_CHECKSUM_LEN: usize = 4;
-const SEGMENT_HEADER_LEN: usize = SEGMENT_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
+const SEGMENT_RECORD_HEADER_LEN: usize = SEGMENT_RECORD_BASE_HEADER_LEN + SEGMENT_CHECKSUM_LEN;
 const SEGMENT_FILE_SUFFIX: &str = ".segment";
 const MANIFEST_FILE_NAME: &str = "manifest";
 const MANIFEST_TMP_FILE_NAME: &str = "manifest.tmp";
@@ -28,7 +30,7 @@ const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
-const MAX_SET_ITEMS: u64 = 1_000_000;
+const MAX_COUNT_ITEMS: u32 = 1_000_000;
 
 /// Storage synchronization policy for segment data and metadata files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,7 +464,7 @@ impl SegmentWriter {
     }
 
     fn should_rotate(&self, written_bytes: u64) -> bool {
-        if self.segment_len == 0 {
+        if self.segment_len <= SEGMENT_FILE_HEADER_LEN_U64 {
             return false;
         }
         self.segment_len
@@ -482,7 +484,7 @@ impl SegmentWriter {
 
         self.active_segment = next_segment;
         self.file = file;
-        self.segment_len = 0;
+        self.segment_len = SEGMENT_FILE_HEADER_LEN_U64;
         self.unsynced_records = 0;
         self.unsynced_bytes = 0;
         stats.segment_rotated();
@@ -1259,7 +1261,11 @@ fn validate_checkpoint_position(
 
     let segment_path = position.segment.path(dir);
     let mut file = OpenOptions::new().read(true).open(&segment_path)?;
+    read_segment_header(&mut file, false, None)?;
     let file_len = file.metadata()?.len();
+    if position.offset < SEGMENT_FILE_HEADER_LEN_U64 {
+        return Err(invalid_data("checkpoint index offset precedes records"));
+    }
     if file_len < position.offset {
         return Err(invalid_data(
             "checkpoint index offset exceeds segment length",
@@ -1489,8 +1495,14 @@ fn scan_checkpoint_positions(
         .read(true)
         .write(allow_partial)
         .open(&segment.path)?;
+    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+        return Ok(());
+    }
     let file_len = file.metadata()?.len();
-    let start_offset = start_offset.unwrap_or(0);
+    let start_offset = start_offset.unwrap_or(SEGMENT_FILE_HEADER_LEN_U64);
+    if start_offset < SEGMENT_FILE_HEADER_LEN_U64 {
+        return Err(invalid_data("checkpoint scan offset precedes records"));
+    }
     if file_len < start_offset {
         return Err(invalid_data(
             "checkpoint scan offset exceeds segment length",
@@ -1543,7 +1555,9 @@ fn replay_segment(
         .read(true)
         .write(allow_partial)
         .open(&segment.path)?;
-    file.seek(SeekFrom::Start(0))?;
+    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+        return Ok(());
+    }
     let file_len = file.metadata()?.len();
 
     loop {
@@ -1594,7 +1608,9 @@ fn replay_node_segment(
         .read(true)
         .write(allow_partial)
         .open(&segment.path)?;
-    file.seek(SeekFrom::Start(0))?;
+    if !read_segment_header(&mut file, allow_partial, Some(&mut *stats))? {
+        return Ok(());
+    }
     let file_len = file.metadata()?.len();
 
     loop {
@@ -1639,7 +1655,9 @@ fn scan_segment(
         .read(true)
         .write(allow_partial)
         .open(path)?;
-    file.seek(SeekFrom::Start(0))?;
+    if !read_segment_header(&mut file, allow_partial, Some(stats))? {
+        return Ok(());
+    }
     let file_len = file.metadata()?.len();
 
     loop {
@@ -1663,23 +1681,48 @@ fn scan_segment(
     Ok(())
 }
 
+fn read_segment_header(
+    file: &mut File,
+    allow_partial: bool,
+    stats: Option<&mut StorageStatsCounters>,
+) -> io::Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        if allow_partial {
+            return Ok(false);
+        }
+        return Err(invalid_data("missing segment header"));
+    }
+    if file_len < SEGMENT_FILE_HEADER_LEN_U64 {
+        if allow_partial {
+            if let Some(stats) = stats {
+                stats.replay_truncated();
+            }
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(false);
+        }
+        return Err(invalid_data("partial segment header in inactive segment"));
+    }
+
+    let mut magic = [0; SEGMENT_FILE_HEADER_LEN];
+    file.read_exact(&mut magic)?;
+    if &magic != SEGMENT_FORMAT_MAGIC {
+        return Err(invalid_data("unsupported segment format"));
+    }
+    Ok(true)
+}
+
 fn scan_record_frame(file: &mut File, stats: &mut StorageStatsCounters) -> io::Result<Option<()>> {
-    let mut header = [0; SEGMENT_BASE_HEADER_LEN];
+    let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
 
-    if &header[..4] != SEGMENT_FORMAT_MAGIC {
-        return Err(invalid_data("unsupported segment format"));
-    }
-
-    let body_len = u32::from_le_bytes(
-        header[4..8]
-            .try_into()
-            .expect("segment header length should be four bytes"),
-    );
+    let body_len = u32::from_le_bytes(header);
     if MAX_RECORD_BODY_LEN < body_len {
         return Err(invalid_data("segment record is too large"));
     }
@@ -1716,19 +1759,25 @@ fn scan_record_frame(file: &mut File, stats: &mut StorageStatsCounters) -> io::R
 }
 
 fn open_active_segment_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
-        .open(path)
+        .open(path)?;
+    if file.metadata()?.len() == 0 {
+        file.write_all(SEGMENT_FORMAT_MAGIC)?;
+    }
+    Ok(file)
 }
 
 fn create_active_segment_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create_new(true)
         .read(true)
         .append(true)
-        .open(path)
+        .open(path)?;
+    file.write_all(SEGMENT_FORMAT_MAGIC)?;
+    Ok(file)
 }
 
 fn should_sync_metadata(sync: SyncPolicy) -> bool {
@@ -1770,10 +1819,9 @@ fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<V
     }
 
     let mut frame = Vec::new();
-    frame.extend_from_slice(SEGMENT_FORMAT_MAGIC);
     frame.extend_from_slice(&body_len.to_le_bytes());
     frame.extend_from_slice(&crc32c(&body).to_le_bytes());
-    debug_assert_eq!(frame.len(), SEGMENT_HEADER_LEN);
+    debug_assert_eq!(frame.len(), SEGMENT_RECORD_HEADER_LEN);
     frame.extend_from_slice(&body);
     Ok(frame)
 }
@@ -1782,22 +1830,14 @@ fn read_record_body(
     file: &mut File,
     stats: Option<&mut StorageStatsCounters>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let mut header = [0; SEGMENT_BASE_HEADER_LEN];
+    let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
 
-    if &header[..4] != SEGMENT_FORMAT_MAGIC {
-        return Err(invalid_data("unsupported segment format"));
-    }
-
-    let body_len = u32::from_le_bytes(
-        header[4..8]
-            .try_into()
-            .expect("segment header length should be four bytes"),
-    );
+    let body_len = u32::from_le_bytes(header);
     if MAX_RECORD_BODY_LEN < body_len {
         return Err(invalid_data("segment record is too large"));
     }
@@ -1828,7 +1868,7 @@ fn read_record_body(
 }
 
 fn frame_len_from_body(body: &[u8]) -> io::Result<u64> {
-    u64::try_from(SEGMENT_HEADER_LEN + body.len())
+    u64::try_from(SEGMENT_RECORD_HEADER_LEN + body.len())
         .map_err(|_| invalid_data("segment frame length overflow"))
 }
 
@@ -1876,10 +1916,11 @@ fn decode_record_node_id(bytes: &[u8]) -> io::Result<noraft::NodeId> {
 fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()> {
     append.validate()?;
     encode_log_entries(&append.entries, encoder)?;
-    encoder.put_u64(
-        u64::try_from(append.command_payloads.len())
-            .map_err(|_| invalid_input("too many command payloads"))?,
-    );
+    encode_count(
+        append.command_payloads.len(),
+        "too many command payloads",
+        encoder,
+    )?;
     for (index, payload) in &append.command_payloads {
         encode_log_index(*index, encoder);
         encoder.put_u8(payload.tag());
@@ -1890,10 +1931,7 @@ fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()
 
 fn decode_log_append(decoder: &mut Decoder<'_>) -> io::Result<LogAppend> {
     let entries = decode_log_entries(decoder)?;
-    let command_count = decoder.get_u64()?;
-    if MAX_SET_ITEMS < command_count {
-        return Err(invalid_data("too many command payloads"));
-    }
+    let command_count = decode_count(decoder, "too many command payloads")?;
 
     let mut command_payloads = BTreeMap::new();
     for _ in 0..command_count {
@@ -1949,8 +1987,7 @@ fn decode_snapshot_checkpoint(decoder: &mut Decoder<'_>) -> io::Result<SnapshotC
 
 fn encode_log_entries(entries: &noraft::LogEntries, encoder: &mut Encoder) -> io::Result<()> {
     encode_log_position(entries.prev_position(), encoder);
-    encoder
-        .put_u64(u64::try_from(entries.len()).map_err(|_| invalid_input("too many log entries"))?);
+    encode_count(entries.len(), "too many log entries", encoder)?;
     for entry in entries.iter() {
         encode_log_entry(&entry, encoder)?;
     }
@@ -1959,10 +1996,7 @@ fn encode_log_entries(entries: &noraft::LogEntries, encoder: &mut Encoder) -> io
 
 fn decode_log_entries(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogEntries> {
     let prev_position = decode_log_position(decoder)?;
-    let len = decoder.get_u64()?;
-    if MAX_SET_ITEMS < len {
-        return Err(invalid_data("too many log entries"));
-    }
+    let len = decode_count(decoder, "too many log entries")?;
 
     let mut entries = noraft::LogEntries::new(prev_position);
     for _ in 0..len {
@@ -2015,7 +2049,7 @@ fn encode_node_id_set(
     nodes: &std::collections::BTreeSet<noraft::NodeId>,
     encoder: &mut Encoder,
 ) -> io::Result<()> {
-    encoder.put_u64(u64::try_from(nodes.len()).map_err(|_| invalid_input("too many node IDs"))?);
+    encode_count(nodes.len(), "too many node IDs", encoder)?;
     for node in nodes {
         encode_node_id(*node, encoder);
     }
@@ -2025,10 +2059,7 @@ fn encode_node_id_set(
 fn decode_node_id_set(
     decoder: &mut Decoder<'_>,
 ) -> io::Result<std::collections::BTreeSet<noraft::NodeId>> {
-    let len = decoder.get_u64()?;
-    if MAX_SET_ITEMS < len {
-        return Err(invalid_data("too many node IDs"));
-    }
+    let len = decode_count(decoder, "too many node IDs")?;
 
     let mut nodes = std::collections::BTreeSet::new();
     for _ in 0..len {
@@ -2093,6 +2124,23 @@ fn decode_log_index(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogIndex> {
     Ok(noraft::LogIndex::new(decoder.get_u64()?))
 }
 
+fn encode_count(value: usize, error: &'static str, encoder: &mut Encoder) -> io::Result<()> {
+    let value = u32::try_from(value).map_err(|_| invalid_input(error))?;
+    if MAX_COUNT_ITEMS < value {
+        return Err(invalid_input(error));
+    }
+    encoder.put_u32(value);
+    Ok(())
+}
+
+fn decode_count(decoder: &mut Decoder<'_>, error: &'static str) -> io::Result<u32> {
+    let value = decoder.get_u32()?;
+    if MAX_COUNT_ITEMS < value {
+        return Err(invalid_data(error));
+    }
+    Ok(value)
+}
+
 const CRC32C_POLYNOMIAL: u32 = 0x82F6_3B78;
 const CRC32C_TABLE: [u32; 256] = make_crc32c_table();
 
@@ -2150,14 +2198,21 @@ impl Encoder {
         self.bytes.push(value);
     }
 
+    fn put_u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn put_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn put_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.put_u64(
-            u64::try_from(bytes.len()).map_err(|_| invalid_input("byte slice is too large"))?,
-        );
+        let len =
+            u32::try_from(bytes.len()).map_err(|_| invalid_input("byte slice is too large"))?;
+        if MAX_RECORD_BODY_LEN < len {
+            return Err(invalid_input("byte slice is too large"));
+        }
+        self.put_u32(len);
         self.bytes.extend_from_slice(bytes);
         Ok(())
     }
@@ -2183,6 +2238,13 @@ impl<'a> Decoder<'a> {
         Ok(bytes[0])
     }
 
+    fn get_u32(&mut self) -> io::Result<u32> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("u32 encoding should be four bytes"),
+        ))
+    }
+
     fn get_u64(&mut self) -> io::Result<u64> {
         let bytes = self.take(8)?;
         Ok(u64::from_le_bytes(
@@ -2193,8 +2255,8 @@ impl<'a> Decoder<'a> {
     }
 
     fn get_bytes(&mut self) -> io::Result<&'a [u8]> {
-        let len = self.get_u64()?;
-        if u64::from(MAX_RECORD_BODY_LEN) < len {
+        let len = self.get_u32()?;
+        if MAX_RECORD_BODY_LEN < len {
             return Err(invalid_data("byte slice is too large"));
         }
         let len = usize::try_from(len).map_err(|_| invalid_data("byte slice is too large"))?;

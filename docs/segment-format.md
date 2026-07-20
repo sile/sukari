@@ -4,15 +4,20 @@ This document specifies the current `sukari` segment record format.
 
 The current segment magic is `SKR1`.
 
-## Frame Layout
+## Segment Layout
 
-Segment files contain a sequence of `SKR1` frames. They have no file-level
-header. All integer fields are little-endian.
+Segment files begin with a file-level header and then contain a sequence of
+record frames. All integer fields are little-endian.
 
-Each frame has this layout:
+The segment header is:
 
 ```text
 4 bytes  magic: "SKR1"
+```
+
+Each record frame has this layout:
+
+```text
 4 bytes  body length as u32
 4 bytes  CRC-32C checksum of the body as u32
 N bytes  body
@@ -20,8 +25,8 @@ N bytes  body
 
 Readers treat checksum mismatches, unknown tags, unsupported formats,
 over-limit lengths, and trailing garbage in inactive segments as corruption. A
-trailing partial frame is tolerated only in the active append segment and is
-truncated during recovery or replay.
+trailing partial header or frame is tolerated only in the active append segment
+and is truncated during recovery or replay.
 
 ## Record Body
 
@@ -65,7 +70,7 @@ A log append payload is:
 
 ```text
 LogEntries
-8 bytes       command payload count as u64
+4 bytes       command payload count as u32
 repeated:
   8 bytes     command log index as u64
   1 byte      command payload tag as u8
@@ -76,7 +81,7 @@ repeated:
 
 ```text
 LogPosition   previous log position
-8 bytes       entry count as u64
+4 bytes       entry count as u32
 repeated:
   LogEntry
 ```
@@ -134,7 +139,7 @@ NodeIdSet  non_voters
 Each node ID set is encoded in ascending node ID order:
 
 ```text
-8 bytes  node count as u64
+4 bytes  node count as u32
 repeated:
   8 bytes  node_id as u64
 ```
@@ -142,7 +147,7 @@ repeated:
 `Bytes` is encoded as:
 
 ```text
-8 bytes  byte length as u64
+4 bytes  byte length as u32
 N bytes  byte payload
 ```
 

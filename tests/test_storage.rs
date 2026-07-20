@@ -22,7 +22,7 @@ const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
 const NODE_REGISTRY_TMP_FILE_NAME: &str = "nodes.json.tmp";
 const CHECKPOINT_INDEX_FILE_NAME: &str = "checkpoints.json";
 const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
-const SEGMENT_HEADER_LEN: u64 = 12;
+const FIRST_RECORD_BODY_OFFSET: u64 = 12;
 const MAX_RECORD_BODY_LEN: u32 = 1024 * 1024 * 1024;
 
 #[test]
@@ -609,7 +609,7 @@ fn storage_engine_persists_checkpoint_index_positions() {
     assert!(checkpoint_index.contains(r#""version": 1"#));
     assert!(checkpoint_index.contains(r#""1": {"#));
     assert!(checkpoint_index.contains(r#""checkpoint_segment": "append-2.segment""#));
-    assert!(checkpoint_index.contains(r#""checkpoint_offset": 0"#));
+    assert!(checkpoint_index.contains(r#""checkpoint_offset": 4"#));
     assert!(!segment_path(&dir).exists());
     assert!(!segment_path_named(&dir, SECOND_SEGMENT_FILE_NAME).exists());
     assert!(segment_path_named(&dir, THIRD_SEGMENT_FILE_NAME).exists());
@@ -689,7 +689,7 @@ fn storage_engine_rejects_invalid_checkpoint_index_files() {
             r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-0.segment","checkpoint_offset":999999}}}"#,
         ),
         (
-            "offset-inside-record",
+            "offset-inside-file-header",
             r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-0.segment","checkpoint_offset":1}}}"#,
         ),
     ] {
@@ -718,7 +718,7 @@ fn storage_engine_rejects_checkpoint_index_that_points_to_non_checkpoint_record(
 
     write_checkpoint_index(
         &dir,
-        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-1.segment","checkpoint_offset":0}}}"#,
+        r#"{"version":1,"nodes":{"1":{"checkpoint_segment":"append-1.segment","checkpoint_offset":4}}}"#,
     );
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
@@ -750,7 +750,7 @@ fn storage_engine_rejects_checkpoint_index_node_id_mismatch() {
 
     write_checkpoint_index(
         &dir,
-        r#"{"version":1,"nodes":{"2":{"checkpoint_segment":"append-0.segment","checkpoint_offset":0}}}"#,
+        r#"{"version":1,"nodes":{"2":{"checkpoint_segment":"append-0.segment","checkpoint_offset":4}}}"#,
     );
 
     let err = StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync)
@@ -1878,7 +1878,7 @@ fn storage_engine_truncates_trailing_partial_record() {
         .append(true)
         .open(&path)
         .expect("segment should open");
-    file.write_all(b"SKR1")
+    file.write_all(&[0, 0])
         .expect("partial record should be written");
     drop(file);
 
@@ -1923,7 +1923,7 @@ fn storage_engine_truncates_trailing_partial_record_in_latest_segment() {
         .append(true)
         .open(&path)
         .expect("latest segment should open");
-    file.write_all(b"SKR1")
+    file.write_all(&[0, 0])
         .expect("partial record should be written");
     drop(file);
 
@@ -1956,7 +1956,7 @@ fn storage_engine_rejects_trailing_partial_record_in_inactive_segment() {
         .append(true)
         .open(&path)
         .expect("inactive segment should open");
-    file.write_all(b"SKR1")
+    file.write_all(&[0, 0])
         .expect("partial record should be written");
     drop(file);
 
@@ -1983,7 +1983,7 @@ fn storage_engine_rejects_corrupted_checksum() {
         .write(true)
         .open(&path)
         .expect("segment should open");
-    file.seek(SeekFrom::Start(SEGMENT_HEADER_LEN))
+    file.seek(SeekFrom::Start(FIRST_RECORD_BODY_OFFSET))
         .expect("segment body should be reachable");
     file.write_all(&[0xFF])
         .expect("segment body should be corrupted");

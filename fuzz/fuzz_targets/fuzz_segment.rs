@@ -56,12 +56,12 @@ fuzz_target!(|data: &[u8]| {
     let mut body = Vec::new();
     body.extend_from_slice(&1u64.to_le_bytes());
     body.extend_from_slice(data);
-    if let Some(frame) = segment_frame(&body) {
-        exercise_segment(&frame);
+    if let Some(segment) = segment_file_with_record(&body) {
+        exercise_segment(&segment);
     }
 
-    if let Some(frame) = segment_frame(data) {
-        exercise_segment(&frame);
+    if let Some(segment) = segment_file_with_record(data) {
+        exercise_segment(&segment);
     }
 });
 
@@ -82,14 +82,14 @@ fn exercise_segment(segment: &[u8]) {
     let _ = engine.load_all();
 }
 
-fn segment_frame(body: &[u8]) -> Option<Vec<u8>> {
+fn segment_file_with_record(body: &[u8]) -> Option<Vec<u8>> {
     let body_len = u32::try_from(body.len()).ok()?;
-    let mut frame = Vec::new();
-    frame.extend_from_slice(b"SKR1");
-    frame.extend_from_slice(&body_len.to_le_bytes());
-    frame.extend_from_slice(&crc32c(body).to_le_bytes());
-    frame.extend_from_slice(body);
-    Some(frame)
+    let mut segment = Vec::new();
+    segment.extend_from_slice(b"SKR1");
+    segment.extend_from_slice(&body_len.to_le_bytes());
+    segment.extend_from_slice(&crc32c(body).to_le_bytes());
+    segment.extend_from_slice(body);
+    Some(segment)
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {

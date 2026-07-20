@@ -359,7 +359,7 @@ authoritative JSON file, `checkpoints.json`:
     },
     "2": {
       "checkpoint_segment": "append-7.segment",
-      "checkpoint_offset": 0
+      "checkpoint_offset": 4
     }
   }
 }
