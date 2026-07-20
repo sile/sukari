@@ -1887,10 +1887,7 @@ fn index(index: u64) -> noraft::LogIndex {
 }
 
 fn position(term: u64, index: u64) -> noraft::LogPosition {
-    noraft::LogPosition {
-        term: noraft::Term::new(term),
-        index: noraft::LogIndex::new(index),
-    }
+    noraft::LogPosition::new(noraft::Term::new(term), noraft::LogIndex::new(index))
 }
 
 fn segment_path(dir: &Path) -> PathBuf {

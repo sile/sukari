@@ -354,10 +354,10 @@ fn encode_log_position(position: noraft::LogPosition, encoder: &mut Encoder) -> 
 }
 
 fn decode_log_position(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogPosition> {
-    Ok(noraft::LogPosition {
-        term: decode_term(decoder)?,
-        index: decode_log_index(decoder)?,
-    })
+    Ok(noraft::LogPosition::new(
+        decode_term(decoder)?,
+        decode_log_index(decoder)?,
+    ))
 }
 
 fn encode_term(term: noraft::Term, encoder: &mut Encoder) -> io::Result<()> {

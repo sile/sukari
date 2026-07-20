@@ -17,7 +17,7 @@ exclude = ["fuzz"]
 
 [workspace.dependencies]
 # Core Raft state machine and protocol types.
-noraft = "0.6"
+noraft = "0.6.2"
 # Node registry JSON parsing and formatting.
 nojson = "0.3"
 

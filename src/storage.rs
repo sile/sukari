@@ -617,23 +617,11 @@ impl NodeState {
 
     fn apply_append_owned(&mut self, append: LogAppend) -> io::Result<()> {
         append.validate()?;
-        if !self.log.entries().contains(append.entries.prev_position()) {
+        let prev_index = append.entries.prev_position().index;
+        if !self.log.append_suffix(&append.entries) {
             return Err(invalid_data("append anchor does not exist in local log"));
         }
 
-        let keep_len = append.entries.prev_position().index.get()
-            - self.log.entries().prev_position().index.get();
-        let keep_len = usize::try_from(keep_len)
-            .map_err(|_| invalid_data("log suffix length exceeds usize"))?;
-
-        let mut entries = self.log.entries().clone();
-        entries.truncate(keep_len);
-        for entry in append.entries.iter() {
-            entries.push(entry);
-        }
-        self.log = noraft::Log::new(self.log.snapshot_config().clone(), entries);
-
-        let prev_index = append.entries.prev_position().index;
         self.command_payloads
             .retain(|index, _| *index <= prev_index);
         self.command_payloads.extend(append.command_payloads);

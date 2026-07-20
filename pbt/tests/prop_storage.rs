@@ -199,7 +199,8 @@ fn choose_position(state: &NodeState, choice: usize) -> noraft::LogPosition {
 fn log_append(prev_position: noraft::LogPosition, entries: Vec<GeneratedEntry>) -> LogAppend {
     let mut log_entries = Vec::new();
     let mut commands = BTreeMap::new();
-    for (next_index, entry) in (prev_position.index.get() + 1..).zip(entries) {
+    let mut next_index = prev_position.index.next();
+    for entry in entries {
         match entry {
             GeneratedEntry::Term(term) => {
                 log_entries.push(noraft::LogEntry::Term(noraft::Term::new(term)));
@@ -209,12 +210,10 @@ fn log_append(prev_position: noraft::LogPosition, entries: Vec<GeneratedEntry>) 
             }
             GeneratedEntry::Command { tag, payload } => {
                 log_entries.push(noraft::LogEntry::Command);
-                commands.insert(
-                    noraft::LogIndex::new(next_index),
-                    CommandPayload::new(tag, Bytes::from(payload)),
-                );
+                commands.insert(next_index, CommandPayload::new(tag, Bytes::from(payload)));
             }
         }
+        next_index = next_index.next();
     }
 
     LogAppend::new(
@@ -243,25 +242,9 @@ fn initial_state() -> NodeState {
 }
 
 fn apply_append_to_expected(state: &mut NodeState, append: &LogAppend) -> Result<(), String> {
-    if !state
-        .log
-        .entries()
-        .contains(append.entries().prev_position())
-    {
+    if !state.log.append_suffix(append.entries()) {
         return Err("append anchor does not exist in expected log".to_owned());
     }
-
-    let keep_len = append.entries().prev_position().index.get()
-        - state.log.entries().prev_position().index.get();
-    let keep_len =
-        usize::try_from(keep_len).map_err(|_| "log suffix length exceeds usize".to_owned())?;
-
-    let mut entries = state.log.entries().clone();
-    entries.truncate(keep_len);
-    for entry in append.entries().iter() {
-        entries.push(entry);
-    }
-    state.log = noraft::Log::new(state.log.snapshot_config().clone(), entries);
 
     let prev_index = append.entries().prev_position().index;
     state
