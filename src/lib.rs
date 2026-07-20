@@ -18,6 +18,12 @@
 //! should make typical Raft storage writes predictable. Recovery APIs read
 //! snapshots and retained log suffixes as whole values, so huge payloads and
 //! random-read log paging are out of scope.
+//!
+//! Ordinary node-state writes do not synchronize the active segment. Callers
+//! decide when pending segment appends become durable by calling
+//! [`StorageEngine::sync`]. Metadata JSON files, directory updates, segment
+//! rotation boundaries, and checkpoint records referenced from
+//! `checkpoints.json` are synchronized by the storage engine.
 
 #![forbid(unsafe_code)]
 
@@ -34,5 +40,5 @@ pub use bytes::Bytes;
 pub use registry::NodeMetadata;
 pub use stats::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
 pub use storage::{
-    CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, SyncPolicy,
+    CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine,
 };

@@ -29,14 +29,14 @@ The public API uses `noraft` and `nojson` types directly.
 ```rust
 use std::collections::BTreeMap;
 
-use sukari::{Bytes, CommandPayload, LogAppend, NodeMetadata, StorageEngine, SyncPolicy};
+use sukari::{Bytes, CommandPayload, LogAppend, NodeMetadata, StorageEngine};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join("sukari-readme-example");
     let _ = std::fs::remove_dir_all(&dir);
 
-    // Open one storage directory and synchronize every durable update.
-    let mut storage = StorageEngine::new(&dir, SyncPolicy::Strict)?;
+    // Open one storage directory.
+    let mut storage = StorageEngine::new(&dir)?;
     let node_id = noraft::NodeId::new(1);
 
     // Node IDs must be registered before node state can be written.
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     storage.append_entries(node_id, LogAppend::new(entries, command_payloads)?)?;
-    storage.flush()?;
+    storage.sync()?;
 
     // Loading replays the retained records for the node into a NodeState.
     let state = storage.load(node_id)?;
@@ -83,11 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 internal mutexes around writes; runtimes that need concurrent access serialize
 storage requests outside this crate.
 
-`SyncPolicy` controls explicit durability. `Strict` synchronizes every storage
-record and metadata update. `Batch` synchronizes segment data after configured
-record or byte thresholds, while metadata replacements remain synchronized;
-`flush()` also synchronizes pending segment data. `UnsafeNoSync` skips explicit
-synchronization and leaves persistence timing to the operating system.
+Segment append durability is caller-managed. Ordinary node-state writes append
+records without synchronizing the active segment; callers decide when to make
+pending segment appends durable by calling `sync()`. Metadata JSON files,
+directory updates, segment rotation boundaries, and checkpoint records that are
+referenced from `checkpoints.json` are synchronized by the storage engine.
 
 Node IDs must be created with `create_node()` before node state can be written
 or loaded. Removed node IDs remain reserved. Writes are appended as received:

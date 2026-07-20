@@ -1,7 +1,6 @@
 //! Node registry metadata.
 
 use crate::error::invalid_json;
-use crate::storage::SyncPolicy;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
@@ -79,7 +78,7 @@ impl NodeRegistry {
         parse_node_registry(json.value()).map_err(invalid_json)
     }
 
-    pub(crate) fn save(&self, dir: &Path, sync: SyncPolicy) -> io::Result<()> {
+    pub(crate) fn save(&self, dir: &Path) -> io::Result<()> {
         let path = dir.join(NODE_REGISTRY_FILE_NAME);
         let tmp_path = dir.join(NODE_REGISTRY_TMP_FILE_NAME);
         let mut file = OpenOptions::new()
@@ -88,15 +87,11 @@ impl NodeRegistry {
             .truncate(true)
             .open(&tmp_path)?;
         file.write_all(format_node_registry(self).as_bytes())?;
-        if should_sync_metadata(sync) {
-            file.sync_all()?;
-        }
+        file.sync_all()?;
         drop(file);
 
         std::fs::rename(&tmp_path, &path)?;
-        if should_sync_metadata(sync) {
-            sync_dir(dir)?;
-        }
+        sync_dir(dir)?;
         Ok(())
     }
 
@@ -257,10 +252,6 @@ impl nojson::DisplayJson for RawJsonText<'_> {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
         write!(f.inner_mut(), "{}", self.0.text())
     }
-}
-
-fn should_sync_metadata(sync: SyncPolicy) -> bool {
-    !matches!(sync, SyncPolicy::UnsafeNoSync)
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {

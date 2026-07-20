@@ -7,7 +7,7 @@ use std::{
 use proptest::prelude::*;
 use sukari::{
     Bytes, CommandPayload, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint,
-    StorageEngine, SyncPolicy,
+    StorageEngine,
 };
 
 const NODE_ID: noraft::NodeId = noraft::NodeId::new(1);
@@ -34,7 +34,7 @@ enum Operation {
 enum MultiNodeOperation {
     Create(u64),
     Remove(usize),
-    Flush,
+    Sync,
     Node { node: usize, operation: Operation },
 }
 
@@ -152,24 +152,11 @@ fn operations() -> impl Strategy<Value = Vec<Operation>> {
     proptest::collection::vec(operation(), 0..=32)
 }
 
-fn sync_policy() -> impl Strategy<Value = SyncPolicy> {
-    prop_oneof![
-        6 => Just(SyncPolicy::UnsafeNoSync),
-        2 => (0usize..=3, 0u64..=256).prop_map(|(max_records, max_bytes)| {
-            SyncPolicy::Batch {
-                max_records,
-                max_bytes,
-            }
-        }),
-        1 => Just(SyncPolicy::Strict),
-    ]
-}
-
 fn multi_node_operation() -> impl Strategy<Value = MultiNodeOperation> {
     prop_oneof![
         1 => (1u64..=4).prop_map(MultiNodeOperation::Create),
         1 => (0usize..=8).prop_map(MultiNodeOperation::Remove),
-        1 => Just(MultiNodeOperation::Flush),
+        1 => Just(MultiNodeOperation::Sync),
         8 => (0usize..=8, operation()).prop_map(|(node, operation)| {
             MultiNodeOperation::Node { node, operation }
         }),
@@ -384,8 +371,8 @@ fn apply_multi_node_operation(
                 active.remove(&node_id);
             }
         }
-        MultiNodeOperation::Flush => {
-            engine.flush().expect("flush should succeed");
+        MultiNodeOperation::Sync => {
+            engine.sync().expect("sync should succeed");
         }
         MultiNodeOperation::Node { node, operation } => {
             if let Some(node_id) = choose_active_node(active, node) {
@@ -409,7 +396,6 @@ proptest! {
         let dir = TempDir::new("sukari-pbt-storage-replay");
         let mut engine = StorageEngine::with_max_segment_len(
             dir.path(),
-            SyncPolicy::UnsafeNoSync,
             max_segment_len,
         )
         .expect("storage should open");
@@ -424,7 +410,7 @@ proptest! {
         drop(engine);
 
         let mut engine =
-            StorageEngine::new(dir.path(), SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+            StorageEngine::new(dir.path()).expect("storage should reopen");
         let loaded = engine.load(NODE_ID).expect("node state should load");
         prop_assert_eq!(&loaded, &expected);
 
@@ -439,14 +425,12 @@ proptest! {
 
     #[test]
     fn multi_node_storage_replay_roundtrip(
-        sync in sync_policy(),
         max_segment_len in 1u64..=512,
         operations in multi_node_operations(),
     ) {
         let dir = TempDir::new("sukari-pbt-multi-node-storage-replay");
         let mut engine = StorageEngine::with_max_segment_len(
             dir.path(),
-            sync,
             max_segment_len,
         )
         .expect("storage should open");
@@ -464,7 +448,7 @@ proptest! {
         drop(engine);
 
         let mut engine =
-            StorageEngine::new(dir.path(), sync).expect("storage should reopen");
+            StorageEngine::new(dir.path()).expect("storage should reopen");
         for (node_id, expected) in &active {
             let loaded = engine.load(*node_id).expect("node state should load");
             prop_assert_eq!(&loaded, expected);

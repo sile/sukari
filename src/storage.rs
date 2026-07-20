@@ -28,30 +28,6 @@ const CHECKPOINT_INDEX_TMP_FILE_NAME: &str = "checkpoints.json.tmp";
 const CHECKPOINT_INDEX_VERSION: u64 = 1;
 const DEFAULT_MAX_SEGMENT_LEN: u64 = 128 * 1024 * 1024;
 
-/// Storage synchronization policy for segment data and metadata files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncPolicy {
-    /// Synchronize durable data after every storage record and metadata update.
-    Strict,
-
-    /// Synchronize durable data after record or byte thresholds are reached.
-    ///
-    /// A zero threshold is ignored. If both thresholds are zero, writes are
-    /// synchronized only when [`StorageEngine::flush`] is called.
-    Batch {
-        /// Maximum number of unsynchronized records.
-        max_records: usize,
-
-        /// Maximum number of unsynchronized bytes.
-        max_bytes: u64,
-    },
-
-    /// Never synchronize durable data or metadata explicitly.
-    ///
-    /// This policy leaves persistence timing to the operating system.
-    UnsafeNoSync,
-}
-
 /// Shared segmented storage engine for registered Raft nodes.
 ///
 /// The engine appends storage records for many nodes into shared append
@@ -73,7 +49,6 @@ pub enum SyncPolicy {
 #[derive(Debug)]
 pub struct StorageEngine {
     dir: PathBuf,
-    sync: SyncPolicy,
     stats: StorageStatsCounters,
     registry: NodeRegistry,
     checkpoint_index: CheckpointIndex,
@@ -86,8 +61,8 @@ impl StorageEngine {
     /// Opening a storage directory recovers the active segment, loads the node
     /// registry and checkpoint index, and prepares the active append segment for
     /// new writes.
-    pub fn new<P: AsRef<Path>>(dir: P, sync: SyncPolicy) -> io::Result<Self> {
-        Self::with_max_segment_len(dir, sync, DEFAULT_MAX_SEGMENT_LEN)
+    pub fn new<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        Self::with_max_segment_len(dir, DEFAULT_MAX_SEGMENT_LEN)
     }
 
     /// Opens or creates a storage engine with a maximum append segment length.
@@ -95,26 +70,26 @@ impl StorageEngine {
     /// `max_segment_len` is a rotation threshold, not a hard per-record limit.
     /// If a record frame is larger than `max_segment_len`, it is written to an
     /// empty segment and that segment is allowed to exceed the threshold.
-    pub fn with_max_segment_len<P: AsRef<Path>>(
-        dir: P,
-        sync: SyncPolicy,
-        max_segment_len: u64,
-    ) -> io::Result<Self> {
+    pub fn with_max_segment_len<P: AsRef<Path>>(dir: P, max_segment_len: u64) -> io::Result<Self> {
         if max_segment_len == 0 {
             return Err(invalid_input("max segment length must be non-zero"));
         }
 
         let dir = dir.as_ref().to_path_buf();
-        create_dir_all_synced(&dir, sync)?;
+        create_dir_all_synced(&dir)?;
         let active_segment = select_active_append_segment(&dir)?;
         let mut stats = StorageStatsCounters::default();
         recover_storage_dir(&dir, active_segment, &mut stats)?;
         let registry = NodeRegistry::load(&dir)?;
         let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
-        let writer = SegmentWriter::open(&dir, sync, active_segment, max_segment_len)?;
+        stats.registry_loaded(
+            usize_to_u64(registry.active_node_count()),
+            usize_to_u64(registry.removed_node_count()),
+        );
+        stats.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
+        let writer = SegmentWriter::open(&dir, active_segment, max_segment_len, &mut stats)?;
         Ok(Self {
             dir,
-            sync,
             stats,
             registry,
             checkpoint_index,
@@ -139,17 +114,17 @@ impl StorageEngine {
             &Record::SnapshotCheckpoint(initial_checkpoint()),
             &mut self.stats,
         )?;
-        if should_sync_metadata(self.sync) {
-            self.writer.flush(&mut self.stats)?;
-        }
+        self.writer.sync(&mut self.stats)?;
 
         let mut checkpoint_index = self.checkpoint_index.clone();
         checkpoint_index.set_checkpoint_position(node_id, append);
-        checkpoint_index.save(&self.dir, self.sync)?;
-        registry.save(&self.dir, self.sync)?;
+        checkpoint_index.save(&self.dir)?;
+        registry.save(&self.dir)?;
         self.registry = registry;
         self.checkpoint_index = checkpoint_index;
         self.stats.node_created();
+        self.refresh_registry_stats();
+        self.refresh_checkpoint_index_stats();
         Ok(())
     }
 
@@ -268,14 +243,13 @@ impl StorageEngine {
             &Record::SnapshotCheckpoint(checkpoint),
             &mut self.stats,
         )?;
-        if should_sync_metadata(self.sync) {
-            self.writer.flush(&mut self.stats)?;
-        }
+        self.writer.sync(&mut self.stats)?;
 
         let mut checkpoint_index = self.checkpoint_index.clone();
         checkpoint_index.set_checkpoint_position(node_id, append);
-        checkpoint_index.save(&self.dir, self.sync)?;
+        checkpoint_index.save(&self.dir)?;
         self.checkpoint_index = checkpoint_index;
+        self.refresh_checkpoint_index_stats();
         self.collect_garbage()?;
         self.stats.snapshot_checkpoint_saved();
         Ok(())
@@ -289,22 +263,36 @@ impl StorageEngine {
         self.ensure_node_exists(node_id, StorageOperationKind::RemoveNode)?;
         let mut registry = self.registry.clone();
         registry.remove_node(node_id)?;
-        registry.save(&self.dir, self.sync)?;
+        registry.save(&self.dir)?;
         self.registry = registry;
 
         let mut checkpoint_index = self.checkpoint_index.clone();
         checkpoint_index.remove_node(node_id);
-        checkpoint_index.save(&self.dir, self.sync)?;
+        checkpoint_index.save(&self.dir)?;
         self.checkpoint_index = checkpoint_index;
         self.collect_garbage()?;
         self.stats.node_removed();
+        self.refresh_registry_stats();
+        self.refresh_checkpoint_index_stats();
         Ok(())
     }
 
-    /// Flushes pending segment writes according to the synchronization policy.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush(&mut self.stats)?;
-        self.stats.flushed();
+    /// Synchronizes pending segment appends.
+    ///
+    /// Ordinary node-state writes such as [`Self::save_current_term`],
+    /// [`Self::save_voted_for`], and [`Self::append_entries`] append records
+    /// without synchronizing the active segment. Call this after the batch of
+    /// records that must become durable before the caller reports success or
+    /// advances application state. Multi-Raft runtimes can append records for
+    /// several nodes, call `sync()` once, and then reply to every request in
+    /// that batch.
+    ///
+    /// Metadata JSON updates, segment rotation boundaries, and checkpoint
+    /// records referenced from `checkpoints.json` are synchronized internally.
+    /// Calling this method with no pending appends is valid.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.stats.sync_requested();
+        self.writer.sync(&mut self.stats)?;
         Ok(())
     }
 
@@ -313,22 +301,9 @@ impl StorageEngine {
         &self.dir
     }
 
-    /// Returns the storage synchronization policy.
-    pub fn sync_policy(&self) -> SyncPolicy {
-        self.sync
-    }
-
-    /// Returns a snapshot of storage statistics since this engine was opened.
-    pub fn stats(&self) -> StorageStats {
-        let mut stats = self.stats.snapshot();
-        stats.active_nodes = usize_to_u64(self.registry.active_node_count());
-        stats.removed_nodes = usize_to_u64(self.registry.removed_node_count());
-        stats.checkpoint_index_nodes = usize_to_u64(self.checkpoint_index.len());
-        stats.active_append_segment_id = self.writer.active_segment().id();
-        stats.active_append_segment_len_bytes = self.writer.segment_len();
-        stats.unsynced_records = usize_to_u64(self.writer.unsynced_records());
-        stats.unsynced_bytes = self.writer.unsynced_bytes();
-        stats
+    /// Returns storage statistics since this engine was opened.
+    pub fn stats(&self) -> &StorageStats {
+        self.stats.as_ref()
     }
 
     fn save_record(
@@ -386,10 +361,22 @@ impl StorageEngine {
         if deleted_segments != 0 {
             self.stats.gc_deleted_segments(deleted_segments);
         }
-        if deleted_segments != 0 && should_sync_metadata(self.sync) {
+        if deleted_segments != 0 {
             sync_dir(&self.dir)?;
         }
         Ok(())
+    }
+
+    fn refresh_registry_stats(&mut self) {
+        self.stats.node_counts_changed(
+            usize_to_u64(self.registry.active_node_count()),
+            usize_to_u64(self.registry.removed_node_count()),
+        );
+    }
+
+    fn refresh_checkpoint_index_stats(&mut self) {
+        self.stats
+            .checkpoint_index_changed(usize_to_u64(self.checkpoint_index.len()));
     }
 }
 
@@ -716,7 +703,7 @@ impl CheckpointIndex {
         Ok(index)
     }
 
-    fn save(&self, dir: &Path, sync: SyncPolicy) -> io::Result<()> {
+    fn save(&self, dir: &Path) -> io::Result<()> {
         let path = dir.join(CHECKPOINT_INDEX_FILE_NAME);
         let tmp_path = dir.join(CHECKPOINT_INDEX_TMP_FILE_NAME);
         let mut file = OpenOptions::new()
@@ -725,15 +712,11 @@ impl CheckpointIndex {
             .truncate(true)
             .open(&tmp_path)?;
         file.write_all(format_checkpoint_index(self).as_bytes())?;
-        if should_sync_metadata(sync) {
-            file.sync_all()?;
-        }
+        file.sync_all()?;
         drop(file);
 
         std::fs::rename(&tmp_path, &path)?;
-        if should_sync_metadata(sync) {
-            sync_dir(dir)?;
-        }
+        sync_dir(dir)?;
         Ok(())
     }
 
@@ -1307,14 +1290,10 @@ fn scan_segment(
     Ok(())
 }
 
-pub(crate) fn should_sync_metadata(sync: SyncPolicy) -> bool {
-    !matches!(sync, SyncPolicy::UnsafeNoSync)
-}
-
-fn create_dir_all_synced(path: &Path, sync: SyncPolicy) -> io::Result<()> {
+fn create_dir_all_synced(path: &Path) -> io::Result<()> {
     let existed = path.exists();
     std::fs::create_dir_all(path)?;
-    if !existed && should_sync_metadata(sync) {
+    if !existed {
         sync_parent_dir(path)?;
     }
     Ok(())

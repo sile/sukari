@@ -84,7 +84,7 @@ writer:
 - save voted-for node
 - append log entries and command payloads
 - save snapshot checkpoint
-- flush pending writes
+- synchronize pending segment appends
 - load all non-removed node states
 - remove a node and reserve its node ID
 
@@ -96,11 +96,12 @@ cannot be created again.
 concurrent runtime integration own serialization outside this crate, for example
 by routing storage requests through a dedicated storage task.
 
-`SyncPolicy` controls explicit durability. `Strict` synchronizes every storage
-record and metadata update. `Batch` synchronizes segment data after configured
-record or byte thresholds, while metadata replacements remain synchronized;
-`flush()` also synchronizes pending segment data. `UnsafeNoSync` skips explicit
-synchronization and leaves persistence timing to the operating system.
+Segment append durability is caller-managed. Ordinary node-state writes append
+records without synchronizing the active segment; callers decide when to make
+pending segment appends durable by calling `sync()`. This lets a runtime batch
+multiple storage requests before replying to their callers. Metadata JSON files,
+directory updates, segment rotation boundaries, and checkpoint records that are
+referenced from `checkpoints.json` are synchronized by the storage engine.
 
 Write operations append storage records as they are received. The storage layer
 validates record-local invariants, such as frame checksums and command payload
@@ -172,10 +173,10 @@ without interpreting it.
 
 `nodes.json` contains all node entries in one small file and is updated by
 atomic replacement. The update protocol writes `nodes.json.tmp`, syncs it,
-renames it over `nodes.json`, and syncs the parent directory when the sync
-policy requires durable metadata. Startup only reads `nodes.json`; a stale
-`nodes.json.tmp` is ignored. If `nodes.json` exists but is malformed or violates
-the registry schema, opening `StorageEngine` fails with `InvalidData`.
+renames it over `nodes.json`, and syncs the parent directory. Startup only reads
+`nodes.json`; a stale `nodes.json.tmp` is ignored. If `nodes.json` exists but is
+malformed or violates the registry schema, opening `StorageEngine` fails with
+`InvalidData`.
 
 `remove_node()` persists removal by the same atomic `nodes.json` replacement.
 A crash before the rename leaves the previous registry authoritative. A crash
@@ -217,11 +218,9 @@ records for the same node once it sees a valid checkpoint. The checkpoint suffix
 must start at the snapshot's last included position.
 
 `save_snapshot()` also updates `checkpoints.json` with the segment name and
-record offset of the checkpoint record. When the sync policy requires durable
-metadata, the checkpoint record is flushed before `checkpoints.json` is
-replaced. This ordering can leave the index stale after a crash. Under durable
-sync policies, it prevents the index from pointing at a checkpoint record that
-was never made durable.
+record offset of the checkpoint record. The checkpoint record is synchronized
+before `checkpoints.json` is replaced. This prevents the index from pointing at
+a checkpoint record that was never made durable.
 
 `create_node()` uses the same ordering for its initial checkpoint. If a crash
 happens after the checkpoint index update but before the node registry update,
@@ -288,22 +287,22 @@ The typed stats snapshot covers:
 - segment records written and replayed
 - bytes written and replayed
 - segment rotations
-- flushes and durable syncs
+- explicit sync requests and durable segment syncs
 - replay truncations and checksum failures
 - node creation, node removal, and rejected operations for unknown nodes
 - snapshot checkpoints and whole-segment garbage collection
 
-Update paths use pre-created counters so normal storage operations do not
-allocate strings or perform map lookups. `StorageEngine::stats()` returns a
-typed runtime snapshot of storage counters and gauges. Runtime integration
-crates can aggregate that snapshot with transport metrics, add deployment
-labels, and convert the result to Prometheus text or another scrape format.
+Update paths use typed counters so normal storage operations do not allocate
+strings or perform map lookups. `StorageEngine::stats()` returns a reference to
+the current storage counters and gauges. Runtime integration crates can combine
+that view with transport metrics, add deployment labels, and convert the result
+to Prometheus text or another scrape format.
 
 Metric names and labels belong at the runtime integration boundary. If an
 integration exports these stats, it should use a crate-specific prefix such as
 `sukari_` and keep labels low-cardinality. Useful dimensions include operation
-kind, record kind, sync policy, and error kind. Segment IDs, log indexes,
-request IDs, and stream IDs are not labels.
+kind, record kind, and error kind. Segment IDs, log indexes, request IDs, and
+stream IDs are not labels.
 
 ## Compaction and Garbage Collection
 
@@ -359,19 +358,18 @@ removed or unknown nodes are ignored on open, and `remove_node()` removes the
 node from the checkpoint index.
 
 `checkpoints.json` is updated by atomic replacement. A checkpoint update appends
-and durably syncs the checkpoint record first when the sync policy requires it.
-Then it writes `checkpoints.json.tmp`, syncs it when durable metadata is
-required, renames it over `checkpoints.json`, and syncs the parent directory
-when durable metadata is required. Node creation follows the same order before
-updating `nodes.json`. A stale `checkpoints.json.tmp` is ignored.
+and durably syncs the checkpoint record first. Then it writes
+`checkpoints.json.tmp`, syncs it, renames it over `checkpoints.json`, and syncs
+the parent directory. Node creation follows the same order before updating
+`nodes.json`. A stale `checkpoints.json.tmp` is ignored.
 
 Garbage collection is automatic from the library user's perspective. The engine
 checks for deletable segments after a successful snapshot checkpoint and after
 node removal. Ordinary record appends and node creation are not GC triggers
 because they do not make earlier records obsolete. If those operations leave an
 older segment inactive, a later snapshot checkpoint or node removal can collect
-it when the checkpoint barriers allow deletion. When durable metadata is
-required, segment deletion is followed by a directory sync.
+it when the checkpoint barriers allow deletion. Segment deletion is followed by
+a directory sync.
 
 ## Crash Recovery
 

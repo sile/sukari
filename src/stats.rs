@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-/// Runtime storage counter and gauge snapshot.
+/// Runtime storage counters and gauges.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StorageStats {
     /// Segment records written by record kind.
@@ -20,8 +20,8 @@ pub struct StorageStats {
     /// Number of append segment rotations.
     pub segment_rotations: u64,
 
-    /// Number of flush operations.
-    pub flushes: u64,
+    /// Number of explicit segment synchronization requests.
+    pub syncs: u64,
 
     /// Number of successful durable data synchronizations.
     pub durable_syncs: u64,
@@ -80,7 +80,7 @@ impl nojson::DisplayJson for StorageStats {
             f.member("records_replayed", self.records_replayed)?;
             f.member("bytes_replayed", self.bytes_replayed)?;
             f.member("segment_rotations", self.segment_rotations)?;
-            f.member("flushes", self.flushes)?;
+            f.member("syncs", self.syncs)?;
             f.member("durable_syncs", self.durable_syncs)?;
             f.member("replay_truncations", self.replay_truncations)?;
             f.member("checksum_failures", self.checksum_failures)?;
@@ -214,87 +214,64 @@ impl fmt::Display for OperationKindStats {
 
 #[derive(Debug, Default)]
 pub(crate) struct StorageStatsCounters {
-    records_written: RecordKindCounters,
-    bytes_written: RecordKindCounters,
-    records_replayed: RecordKindCounters,
-    bytes_replayed: RecordKindCounters,
-    segment_rotations: u64,
-    flushes: u64,
-    durable_syncs: u64,
-    replay_truncations: u64,
-    checksum_failures: u64,
-    nodes_created: u64,
-    nodes_removed: u64,
-    rejected_operations: RejectedOperationCounters,
-    snapshot_checkpoints_saved: u64,
-    gc_runs: u64,
-    gc_segments_deleted: u64,
+    stats: StorageStats,
 }
 
 impl StorageStatsCounters {
-    pub(crate) fn snapshot(&self) -> StorageStats {
-        StorageStats {
-            records_written: self.records_written.snapshot(),
-            bytes_written: self.bytes_written.snapshot(),
-            records_replayed: self.records_replayed.snapshot(),
-            bytes_replayed: self.bytes_replayed.snapshot(),
-            segment_rotations: load(&self.segment_rotations),
-            flushes: load(&self.flushes),
-            durable_syncs: load(&self.durable_syncs),
-            replay_truncations: load(&self.replay_truncations),
-            checksum_failures: load(&self.checksum_failures),
-            nodes_created: load(&self.nodes_created),
-            nodes_removed: load(&self.nodes_removed),
-            rejected_operations: self.rejected_operations.snapshot(),
-            snapshot_checkpoints_saved: load(&self.snapshot_checkpoints_saved),
-            gc_runs: load(&self.gc_runs),
-            gc_segments_deleted: load(&self.gc_segments_deleted),
-            active_nodes: 0,
-            removed_nodes: 0,
-            checkpoint_index_nodes: 0,
-            active_append_segment_id: 0,
-            active_append_segment_len_bytes: 0,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
-        }
+    pub(crate) fn as_ref(&self) -> &StorageStats {
+        &self.stats
     }
 
     pub(crate) fn record_written(&mut self, kind: RecordKindMetric, bytes: u64) {
-        self.records_written.increment(kind, 1);
-        self.bytes_written.increment(kind, bytes);
+        self.stats.records_written.increment(kind, 1);
+        self.stats.bytes_written.increment(kind, bytes);
+        increment(&mut self.stats.unsynced_records, 1);
+        increment(&mut self.stats.unsynced_bytes, bytes);
     }
 
     pub(crate) fn record_replayed(&mut self, kind: RecordKindMetric, bytes: u64) {
-        self.records_replayed.increment(kind, 1);
-        self.bytes_replayed.increment(kind, bytes);
+        self.stats.records_replayed.increment(kind, 1);
+        self.stats.bytes_replayed.increment(kind, bytes);
     }
 
-    pub(crate) fn segment_rotated(&mut self) {
-        increment(&mut self.segment_rotations, 1);
+    pub(crate) fn segment_opened(&mut self, segment_id: u64, segment_len: u64) {
+        self.stats.active_append_segment_id = segment_id;
+        self.stats.active_append_segment_len_bytes = segment_len;
     }
 
-    pub(crate) fn flushed(&mut self) {
-        increment(&mut self.flushes, 1);
+    pub(crate) fn segment_written(&mut self, segment_len: u64) {
+        self.stats.active_append_segment_len_bytes = segment_len;
     }
 
-    pub(crate) fn durable_synced(&mut self) {
-        increment(&mut self.durable_syncs, 1);
+    pub(crate) fn segment_rotated(&mut self, segment_id: u64, segment_len: u64) {
+        increment(&mut self.stats.segment_rotations, 1);
+        self.segment_opened(segment_id, segment_len);
+    }
+
+    pub(crate) fn sync_requested(&mut self) {
+        increment(&mut self.stats.syncs, 1);
+    }
+
+    pub(crate) fn segment_synced(&mut self) {
+        increment(&mut self.stats.durable_syncs, 1);
+        self.stats.unsynced_records = 0;
+        self.stats.unsynced_bytes = 0;
     }
 
     pub(crate) fn replay_truncated(&mut self) {
-        increment(&mut self.replay_truncations, 1);
+        increment(&mut self.stats.replay_truncations, 1);
     }
 
     pub(crate) fn checksum_failed(&mut self) {
-        increment(&mut self.checksum_failures, 1);
+        increment(&mut self.stats.checksum_failures, 1);
     }
 
     pub(crate) fn node_created(&mut self) {
-        increment(&mut self.nodes_created, 1);
+        increment(&mut self.stats.nodes_created, 1);
     }
 
     pub(crate) fn node_removed(&mut self) {
-        increment(&mut self.nodes_removed, 1);
+        increment(&mut self.stats.nodes_removed, 1);
     }
 
     pub(crate) fn rejected_operation(
@@ -302,40 +279,41 @@ impl StorageStatsCounters {
         operation: StorageOperationKind,
         error: NodeAccessErrorKind,
     ) {
-        self.rejected_operations.increment(operation, error);
+        self.stats.rejected_operations.increment(operation, error);
     }
 
     pub(crate) fn snapshot_checkpoint_saved(&mut self) {
-        increment(&mut self.snapshot_checkpoints_saved, 1);
+        increment(&mut self.stats.snapshot_checkpoints_saved, 1);
     }
 
     pub(crate) fn gc_ran(&mut self) {
-        increment(&mut self.gc_runs, 1);
+        increment(&mut self.stats.gc_runs, 1);
     }
 
     pub(crate) fn gc_deleted_segments(&mut self, count: u64) {
-        increment(&mut self.gc_segments_deleted, count);
+        increment(&mut self.stats.gc_segments_deleted, count);
+    }
+
+    pub(crate) fn registry_loaded(&mut self, active_nodes: u64, removed_nodes: u64) {
+        self.stats.active_nodes = active_nodes;
+        self.stats.removed_nodes = removed_nodes;
+    }
+
+    pub(crate) fn checkpoint_index_loaded(&mut self, nodes: u64) {
+        self.stats.checkpoint_index_nodes = nodes;
+    }
+
+    pub(crate) fn node_counts_changed(&mut self, active_nodes: u64, removed_nodes: u64) {
+        self.stats.active_nodes = active_nodes;
+        self.stats.removed_nodes = removed_nodes;
+    }
+
+    pub(crate) fn checkpoint_index_changed(&mut self, nodes: u64) {
+        self.stats.checkpoint_index_nodes = nodes;
     }
 }
 
-#[derive(Debug, Default)]
-struct RecordKindCounters {
-    current_term: u64,
-    voted_for: u64,
-    log_append: u64,
-    snapshot_checkpoint: u64,
-}
-
-impl RecordKindCounters {
-    fn snapshot(&self) -> RecordKindStats {
-        RecordKindStats {
-            current_term: load(&self.current_term),
-            voted_for: load(&self.voted_for),
-            log_append: load(&self.log_append),
-            snapshot_checkpoint: load(&self.snapshot_checkpoint),
-        }
-    }
-
+impl RecordKindStats {
     fn increment(&mut self, kind: RecordKindMetric, value: u64) {
         match kind {
             RecordKindMetric::CurrentTerm => increment(&mut self.current_term, value),
@@ -348,20 +326,7 @@ impl RecordKindCounters {
     }
 }
 
-#[derive(Debug, Default)]
-struct RejectedOperationCounters {
-    unknown_nodes: OperationKindCounters,
-    removed_nodes: OperationKindCounters,
-}
-
-impl RejectedOperationCounters {
-    fn snapshot(&self) -> RejectedOperationStats {
-        RejectedOperationStats {
-            unknown_nodes: self.unknown_nodes.snapshot(),
-            removed_nodes: self.removed_nodes.snapshot(),
-        }
-    }
-
+impl RejectedOperationStats {
     fn increment(&mut self, operation: StorageOperationKind, error: NodeAccessErrorKind) {
         match error {
             NodeAccessErrorKind::UnknownNode => self.unknown_nodes.increment(operation),
@@ -370,28 +335,7 @@ impl RejectedOperationCounters {
     }
 }
 
-#[derive(Debug, Default)]
-struct OperationKindCounters {
-    load: u64,
-    save_current_term: u64,
-    save_voted_for: u64,
-    append_entries: u64,
-    save_snapshot: u64,
-    remove_node: u64,
-}
-
-impl OperationKindCounters {
-    fn snapshot(&self) -> OperationKindStats {
-        OperationKindStats {
-            load: load(&self.load),
-            save_current_term: load(&self.save_current_term),
-            save_voted_for: load(&self.save_voted_for),
-            append_entries: load(&self.append_entries),
-            save_snapshot: load(&self.save_snapshot),
-            remove_node: load(&self.remove_node),
-        }
-    }
-
+impl OperationKindStats {
     fn increment(&mut self, operation: StorageOperationKind) {
         match operation {
             StorageOperationKind::Load => increment(&mut self.load, 1),
@@ -430,10 +374,6 @@ pub(crate) enum NodeAccessErrorKind {
 
 fn increment(counter: &mut u64, value: u64) {
     *counter = (*counter).saturating_add(value);
-}
-
-fn load(counter: &u64) -> u64 {
-    *counter
 }
 
 fn display_json<T: nojson::DisplayJson>(value: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {

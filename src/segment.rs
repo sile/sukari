@@ -1,7 +1,7 @@
 use crate::codec::encode_record_frame;
 use crate::error::{invalid_data, invalid_input};
 use crate::stats::StorageStatsCounters;
-use crate::storage::{Record, SyncPolicy, should_sync_metadata, sync_parent_dir};
+use crate::storage::{Record, sync_parent_dir};
 
 use std::{
     ffi::OsStr,
@@ -20,37 +20,32 @@ pub(crate) struct SegmentWriter {
     dir: PathBuf,
     active_segment: SegmentName,
     file: File,
-    sync: SyncPolicy,
     segment_len: u64,
     max_segment_len: u64,
-    unsynced_records: usize,
-    unsynced_bytes: u64,
 }
 
 impl SegmentWriter {
     pub(crate) fn open(
         dir: &Path,
-        sync: SyncPolicy,
         active_segment: SegmentName,
         max_segment_len: u64,
+        stats: &mut StorageStatsCounters,
     ) -> io::Result<Self> {
         let segment_path = active_segment.path(dir);
         let file_existed = segment_path.exists();
         let mut file = open_active_segment_file(&segment_path)?;
-        if !file_existed && should_sync_metadata(sync) {
+        if !file_existed {
             sync_parent_dir(&segment_path)?;
         }
         let segment_len = file.seek(SeekFrom::End(0))?;
+        stats.segment_opened(active_segment.id(), segment_len);
 
         Ok(Self {
             dir: dir.to_path_buf(),
             active_segment,
             file,
-            sync,
             segment_len,
             max_segment_len,
-            unsynced_records: 0,
-            unsynced_bytes: 0,
         })
     }
 
@@ -76,32 +71,19 @@ impl SegmentWriter {
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
         stats.record_written(record.metric_kind(), written_bytes);
-        self.after_write(written_bytes, stats)?;
+        stats.segment_written(self.segment_len);
         Ok(record_position)
     }
 
-    pub(crate) fn flush(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        match self.sync {
-            SyncPolicy::UnsafeNoSync => {}
-            SyncPolicy::Strict | SyncPolicy::Batch { .. } => self.sync_data(stats)?,
+    pub(crate) fn sync(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
+        if stats.as_ref().unsynced_records != 0 || stats.as_ref().unsynced_bytes != 0 {
+            self.sync_current_segment(stats)?;
         }
         Ok(())
     }
 
     pub(crate) fn active_segment(&self) -> SegmentName {
         self.active_segment
-    }
-
-    pub(crate) fn segment_len(&self) -> u64 {
-        self.segment_len
-    }
-
-    pub(crate) fn unsynced_records(&self) -> usize {
-        self.unsynced_records
-    }
-
-    pub(crate) fn unsynced_bytes(&self) -> u64 {
-        self.unsynced_bytes
     }
 
     fn should_rotate(&self, written_bytes: u64) -> bool {
@@ -114,52 +96,22 @@ impl SegmentWriter {
     }
 
     fn rotate(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        self.flush(stats)?;
+        self.sync_current_segment(stats)?;
         let next_segment = self.active_segment.next_append()?;
         let segment_path = next_segment.path(&self.dir);
         let file = create_active_segment_file(&segment_path)?;
-        if should_sync_metadata(self.sync) {
-            sync_parent_dir(&segment_path)?;
-        }
+        sync_parent_dir(&segment_path)?;
 
         self.active_segment = next_segment;
         self.file = file;
         self.segment_len = SEGMENT_FILE_HEADER_LEN_U64;
-        self.unsynced_records = 0;
-        self.unsynced_bytes = 0;
-        stats.segment_rotated();
+        stats.segment_rotated(self.active_segment.id(), self.segment_len);
         Ok(())
     }
 
-    fn after_write(
-        &mut self,
-        written_bytes: u64,
-        stats: &mut StorageStatsCounters,
-    ) -> io::Result<()> {
-        match self.sync {
-            SyncPolicy::Strict => self.sync_data(stats),
-            SyncPolicy::Batch {
-                max_records,
-                max_bytes,
-            } => {
-                self.unsynced_records += 1;
-                self.unsynced_bytes += written_bytes;
-                let records_reached = max_records != 0 && max_records <= self.unsynced_records;
-                let bytes_reached = max_bytes != 0 && max_bytes <= self.unsynced_bytes;
-                if records_reached || bytes_reached {
-                    self.sync_data(stats)?;
-                }
-                Ok(())
-            }
-            SyncPolicy::UnsafeNoSync => Ok(()),
-        }
-    }
-
-    fn sync_data(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
+    fn sync_current_segment(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
         self.file.sync_data()?;
-        self.unsynced_records = 0;
-        self.unsynced_bytes = 0;
-        stats.durable_synced();
+        stats.segment_synced();
         Ok(())
     }
 }
