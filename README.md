@@ -12,19 +12,69 @@ more local Raft nodes.
 The name `sukari` refers to a Japanese fishing basket kept in water, evoking a
 small storage container beside a raft.
 
-The crate provides a storage backend that uses `noraft` protocol types
-directly. When multiple nodes share a storage directory, it can batch durable
-writes into shared append-only segment files. Higher-level runtime and
-control-plane crates can use it without taking ownership of shared storage
-format, replay, compaction, and recovery details.
-
 ## Key Characteristics
 
-`sukari` favors a simple runtime path: ordinary writes append records to shared
-segments, and full reads are mainly for startup or recovery. This should make
-typical Raft storage writes predictable. Recovery APIs read snapshots and
-retained log suffixes as whole values, so huge payloads and random-read log
-paging are out of scope.
+`sukari` uses `noraft` protocol types directly and owns the shared storage
+format, replay, checkpoints, and whole-segment garbage collection. It favors a
+simple runtime path: ordinary writes append records to shared segments, and full
+reads are mainly for startup or recovery. This should make typical Raft storage
+writes predictable. Recovery APIs read snapshots and retained log suffixes as
+whole values, so huge payloads and random-read log paging are out of scope.
+
+## Example
+
+The public API uses `noraft` and `nojson` types directly.
+
+```rust
+use std::collections::BTreeMap;
+
+use sukari::{Bytes, CommandPayload, LogAppend, NodeMetadata, StorageEngine, SyncPolicy};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join("sukari-readme-example");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Open one storage directory with strict durability for each write.
+    let mut storage = StorageEngine::new(&dir, SyncPolicy::Strict)?;
+    let node_id = noraft::NodeId::new(1);
+
+    // Node IDs must be registered before node state can be written.
+    storage.create_node(
+        node_id,
+        NodeMetadata::new(
+            true,
+            nojson::RawJsonOwned::parse(r#"{"role":"control"}"#)?,
+        ),
+    )?;
+
+    // Persist Raft hard state as append records.
+    storage.save_current_term(node_id, noraft::Term::new(1))?;
+    storage.save_voted_for(node_id, None)?;
+
+    // Command entries carry opaque payload bytes plus a small application tag.
+    let entries = noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
+        [
+            noraft::LogEntry::Term(noraft::Term::new(1)),
+            noraft::LogEntry::Command,
+        ],
+    );
+    let mut command_payloads = BTreeMap::new();
+    command_payloads.insert(
+        noraft::LogIndex::new(2),
+        CommandPayload::new(0, Bytes::from(b"command".as_slice())),
+    );
+
+    storage.append_entries(node_id, LogAppend::new(entries, command_payloads)?)?;
+    storage.flush()?;
+
+    // Loading replays the retained records for the node into a NodeState.
+    let state = storage.load(node_id)?;
+    assert_eq!(state.current_term, noraft::Term::new(1));
+
+    Ok(())
+}
+```
 
 ## Storage Model
 
@@ -49,56 +99,6 @@ the node become obsolete for replay and whole-segment garbage collection.
 `load()` and `load_all()` construct `NodeState` values on demand. The design
 assumes that the loaded snapshot payload and retained log suffix fit comfortably
 in memory.
-
-## Example
-
-The public API uses `noraft` and `nojson` types directly.
-
-```rust
-use std::collections::BTreeMap;
-
-use sukari::{Bytes, CommandPayload, LogAppend, NodeMetadata, StorageEngine, SyncPolicy};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::temp_dir().join("sukari-readme-example");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let mut storage = StorageEngine::new(&dir, SyncPolicy::Strict)?;
-    let node_id = noraft::NodeId::new(1);
-
-    storage.create_node(
-        node_id,
-        NodeMetadata::new(
-            true,
-            nojson::RawJsonOwned::parse(r#"{"role":"control"}"#)?,
-        ),
-    )?;
-
-    storage.save_current_term(node_id, noraft::Term::new(1))?;
-    storage.save_voted_for(node_id, None)?;
-
-    let entries = noraft::LogEntries::from_iter(
-        noraft::LogPosition::ZERO,
-        [
-            noraft::LogEntry::Term(noraft::Term::new(1)),
-            noraft::LogEntry::Command,
-        ],
-    );
-    let mut command_payloads = BTreeMap::new();
-    command_payloads.insert(
-        noraft::LogIndex::new(2),
-        CommandPayload::new(0, Bytes::from(b"command".as_slice())),
-    );
-
-    storage.append_entries(node_id, LogAppend::new(entries, command_payloads)?)?;
-    storage.flush()?;
-
-    let state = storage.load(node_id)?;
-    assert_eq!(state.current_term, noraft::Term::new(1));
-
-    Ok(())
-}
-```
 
 ## Documents
 
