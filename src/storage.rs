@@ -1696,7 +1696,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 
 fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> io::Result<Vec<u8>> {
     let mut body = Encoder::new();
-    encode_node_id(node_id, &mut body);
+    encode_node_id(node_id, &mut body)?;
     encode_record(record, &mut body)?;
     let body = body.finish();
 
@@ -1762,19 +1762,19 @@ fn frame_len_from_body(body: &[u8]) -> io::Result<u64> {
 fn encode_record(record: &Record, encoder: &mut Encoder) -> io::Result<()> {
     match record {
         Record::CurrentTerm(term) => {
-            encoder.put_u8(0);
-            encode_term(*term, encoder);
+            encoder.put_u8(0)?;
+            encode_term(*term, encoder)?;
         }
         Record::VotedFor(voted_for) => {
-            encoder.put_u8(1);
-            encode_optional_node_id(*voted_for, encoder);
+            encoder.put_u8(1)?;
+            encode_optional_node_id(*voted_for, encoder)?;
         }
         Record::Append(append) => {
-            encoder.put_u8(2);
+            encoder.put_u8(2)?;
             encode_log_append(append, encoder)?;
         }
         Record::SnapshotCheckpoint(checkpoint) => {
-            encoder.put_u8(3);
+            encoder.put_u8(3)?;
             encode_snapshot_checkpoint(checkpoint, encoder)?;
         }
     }
@@ -1809,8 +1809,8 @@ fn encode_log_append(append: &LogAppend, encoder: &mut Encoder) -> io::Result<()
         encoder,
     )?;
     for (index, payload) in &append.command_payloads {
-        encode_log_index(*index, encoder);
-        encoder.put_u8(payload.tag());
+        encode_log_index(*index, encoder)?;
+        encoder.put_u8(payload.tag())?;
         encoder.put_bytes(payload.bytes().as_slice())?;
     }
     Ok(())
@@ -1835,7 +1835,7 @@ fn decode_log_append(decoder: &mut Decoder<'_>) -> io::Result<LogAppend> {
 }
 
 fn encode_snapshot(snapshot: &Snapshot, encoder: &mut Encoder) -> io::Result<()> {
-    encode_log_position(snapshot.last_included, encoder);
+    encode_log_position(snapshot.last_included, encoder)?;
     encode_cluster_config(&snapshot.config, encoder)?;
     encoder.put_bytes(snapshot.data.as_slice())
 }
@@ -1853,8 +1853,8 @@ fn encode_snapshot_checkpoint(
     encoder: &mut Encoder,
 ) -> io::Result<()> {
     checkpoint.validate()?;
-    encode_term(checkpoint.current_term, encoder);
-    encode_optional_node_id(checkpoint.voted_for, encoder);
+    encode_term(checkpoint.current_term, encoder)?;
+    encode_optional_node_id(checkpoint.voted_for, encoder)?;
     encode_snapshot(&checkpoint.snapshot, encoder)?;
     encode_log_append(&checkpoint.suffix, encoder)
 }
@@ -1873,7 +1873,7 @@ fn decode_snapshot_checkpoint(decoder: &mut Decoder<'_>) -> io::Result<SnapshotC
 }
 
 fn encode_log_entries(entries: &noraft::LogEntries, encoder: &mut Encoder) -> io::Result<()> {
-    encode_log_position(entries.prev_position(), encoder);
+    encode_log_position(entries.prev_position(), encoder)?;
     encode_count(entries.len(), "too many log entries", encoder)?;
     for entry in entries.iter() {
         encode_log_entry(&entry, encoder)?;
@@ -1895,14 +1895,14 @@ fn decode_log_entries(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogEntrie
 fn encode_log_entry(entry: &noraft::LogEntry, encoder: &mut Encoder) -> io::Result<()> {
     match entry {
         noraft::LogEntry::Term(term) => {
-            encoder.put_u8(0);
-            encode_term(*term, encoder);
+            encoder.put_u8(0)?;
+            encode_term(*term, encoder)?;
         }
         noraft::LogEntry::ClusterConfig(config) => {
-            encoder.put_u8(1);
+            encoder.put_u8(1)?;
             encode_cluster_config(config, encoder)?;
         }
-        noraft::LogEntry::Command => encoder.put_u8(2),
+        noraft::LogEntry::Command => encoder.put_u8(2)?,
     }
     Ok(())
 }
@@ -1938,7 +1938,7 @@ fn encode_node_id_set(
 ) -> io::Result<()> {
     encode_count(nodes.len(), "too many node IDs", encoder)?;
     for node in nodes {
-        encode_node_id(*node, encoder);
+        encode_node_id(*node, encoder)?;
     }
     Ok(())
 }
@@ -1957,14 +1957,18 @@ fn decode_node_id_set(
     Ok(nodes)
 }
 
-fn encode_optional_node_id(node_id: Option<noraft::NodeId>, encoder: &mut Encoder) {
+fn encode_optional_node_id(
+    node_id: Option<noraft::NodeId>,
+    encoder: &mut Encoder,
+) -> io::Result<()> {
     match node_id {
         Some(node_id) => {
-            encoder.put_u8(1);
-            encode_node_id(node_id, encoder);
+            encoder.put_u8(1)?;
+            encode_node_id(node_id, encoder)?;
         }
-        None => encoder.put_u8(0),
+        None => encoder.put_u8(0)?,
     }
+    Ok(())
 }
 
 fn decode_optional_node_id(decoder: &mut Decoder<'_>) -> io::Result<Option<noraft::NodeId>> {
@@ -1975,9 +1979,9 @@ fn decode_optional_node_id(decoder: &mut Decoder<'_>) -> io::Result<Option<noraf
     }
 }
 
-fn encode_log_position(position: noraft::LogPosition, encoder: &mut Encoder) {
-    encode_term(position.term, encoder);
-    encode_log_index(position.index, encoder);
+fn encode_log_position(position: noraft::LogPosition, encoder: &mut Encoder) -> io::Result<()> {
+    encode_term(position.term, encoder)?;
+    encode_log_index(position.index, encoder)
 }
 
 fn decode_log_position(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogPosition> {
@@ -1987,24 +1991,24 @@ fn decode_log_position(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogPosit
     })
 }
 
-fn encode_term(term: noraft::Term, encoder: &mut Encoder) {
-    encoder.put_u64(term.get());
+fn encode_term(term: noraft::Term, encoder: &mut Encoder) -> io::Result<()> {
+    encoder.put_u64(term.get())
 }
 
 fn decode_term(decoder: &mut Decoder<'_>) -> io::Result<noraft::Term> {
     Ok(noraft::Term::new(decoder.get_u64()?))
 }
 
-fn encode_node_id(node_id: noraft::NodeId, encoder: &mut Encoder) {
-    encoder.put_u64(node_id.get());
+fn encode_node_id(node_id: noraft::NodeId, encoder: &mut Encoder) -> io::Result<()> {
+    encoder.put_u64(node_id.get())
 }
 
 fn decode_node_id(decoder: &mut Decoder<'_>) -> io::Result<noraft::NodeId> {
     Ok(noraft::NodeId::new(decoder.get_u64()?))
 }
 
-fn encode_log_index(index: noraft::LogIndex, encoder: &mut Encoder) {
-    encoder.put_u64(index.get());
+fn encode_log_index(index: noraft::LogIndex, encoder: &mut Encoder) -> io::Result<()> {
+    encoder.put_u64(index.get())
 }
 
 fn decode_log_index(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogIndex> {
@@ -2016,8 +2020,7 @@ fn encode_count(value: usize, error: &'static str, encoder: &mut Encoder) -> io:
     if MAX_COUNT_ITEMS < value {
         return Err(invalid_input(error));
     }
-    encoder.put_u32(value);
-    Ok(())
+    encoder.put_u32(value)
 }
 
 fn decode_count(decoder: &mut Decoder<'_>, error: &'static str) -> io::Result<u32> {
@@ -2031,23 +2034,27 @@ fn decode_count(decoder: &mut Decoder<'_>, error: &'static str) -> io::Result<u3
 #[derive(Debug)]
 struct Encoder {
     bytes: Vec<u8>,
+    len: u32,
 }
 
 impl Encoder {
     fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            len: 0,
+        }
     }
 
-    fn put_u8(&mut self, value: u8) {
-        self.bytes.push(value);
+    fn put_u8(&mut self, value: u8) -> io::Result<()> {
+        self.put_slice(&[value])
     }
 
-    fn put_u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+    fn put_u32(&mut self, value: u32) -> io::Result<()> {
+        self.put_slice(&value.to_le_bytes())
     }
 
-    fn put_u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+    fn put_u64(&mut self, value: u64) -> io::Result<()> {
+        self.put_slice(&value.to_le_bytes())
     }
 
     fn put_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -2056,13 +2063,74 @@ impl Encoder {
         if MAX_RECORD_BODY_LEN < len {
             return Err(invalid_input("byte slice is too large"));
         }
-        self.put_u32(len);
+        let additional = 4usize
+            .checked_add(bytes.len())
+            .ok_or_else(|| invalid_input("record is too large"))?;
+        let new_len = self.check_append_len(additional)?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(bytes);
+        self.len = new_len;
+        Ok(())
+    }
+
+    fn put_slice(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.len = self.check_append_len(bytes.len())?;
         self.bytes.extend_from_slice(bytes);
         Ok(())
     }
 
+    fn check_append_len(&self, additional: usize) -> io::Result<u32> {
+        let additional =
+            u32::try_from(additional).map_err(|_| invalid_input("record is too large"))?;
+        let len = self
+            .len
+            .checked_add(additional)
+            .ok_or_else(|| invalid_input("record is too large"))?;
+        if MAX_RECORD_BODY_LEN < len {
+            return Err(invalid_input("record is too large"));
+        }
+        Ok(len)
+    }
+
     fn finish(self) -> Vec<u8> {
+        debug_assert_eq!(self.bytes.len(), self.len as usize);
         self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_rejects_record_body_limit_before_integer_write() {
+        let mut encoder = encoder_with_len_for_test(MAX_RECORD_BODY_LEN);
+
+        let err = encoder
+            .put_u8(0)
+            .expect_err("integer write should exceed the record body limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(encoder.bytes.is_empty());
+        assert_eq!(encoder.len, MAX_RECORD_BODY_LEN);
+    }
+
+    #[test]
+    fn encoder_rejects_record_body_limit_before_byte_write() {
+        let mut encoder = encoder_with_len_for_test(MAX_RECORD_BODY_LEN - 3);
+
+        let err = encoder
+            .put_bytes(&[])
+            .expect_err("byte length prefix should exceed the record body limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(encoder.bytes.is_empty());
+        assert_eq!(encoder.len, MAX_RECORD_BODY_LEN - 3);
+    }
+
+    fn encoder_with_len_for_test(len: u32) -> Encoder {
+        Encoder {
+            bytes: Vec::new(),
+            len,
+        }
     }
 }
 
