@@ -1,6 +1,11 @@
 # sukari
 
-`sukari` is a shared segmented Raft log storage engine for
+[![sukari](https://img.shields.io/crates/v/sukari.svg)](https://crates.io/crates/sukari)
+[![Documentation](https://docs.rs/sukari/badge.svg)](https://docs.rs/sukari)
+[![Actions Status](https://github.com/sile/sukari/workflows/CI/badge.svg)](https://github.com/sile/sukari/actions)
+![License](https://img.shields.io/crates/l/sukari)
+
+`sukari` is shared append-segment Raft state storage for
 [`noraft`](https://github.com/sile/noraft)-based applications that run one or
 more local Raft nodes.
 

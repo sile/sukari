@@ -1,4 +1,4 @@
-//! Shared segmented Raft log storage for
+//! Shared append-segment Raft state storage for
 //! [`noraft`](https://github.com/sile/noraft)-based applications that run one
 //! or more local Raft nodes.
 //!
