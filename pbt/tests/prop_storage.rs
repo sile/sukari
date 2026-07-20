@@ -31,6 +31,14 @@ enum Operation {
 }
 
 #[derive(Debug, Clone)]
+enum MultiNodeOperation {
+    Create(u64),
+    Remove(usize),
+    Flush,
+    Node { node: usize, operation: Operation },
+}
+
+#[derive(Debug, Clone)]
 enum GeneratedEntry {
     Term(u64),
     ClusterConfig(GeneratedConfig),
@@ -144,6 +152,34 @@ fn operations() -> impl Strategy<Value = Vec<Operation>> {
     proptest::collection::vec(operation(), 0..=32)
 }
 
+fn sync_policy() -> impl Strategy<Value = SyncPolicy> {
+    prop_oneof![
+        6 => Just(SyncPolicy::UnsafeNoSync),
+        2 => (0usize..=3, 0u64..=256).prop_map(|(max_records, max_bytes)| {
+            SyncPolicy::Batch {
+                max_records,
+                max_bytes,
+            }
+        }),
+        1 => Just(SyncPolicy::Strict),
+    ]
+}
+
+fn multi_node_operation() -> impl Strategy<Value = MultiNodeOperation> {
+    prop_oneof![
+        1 => (1u64..=4).prop_map(MultiNodeOperation::Create),
+        1 => (0usize..=8).prop_map(MultiNodeOperation::Remove),
+        1 => Just(MultiNodeOperation::Flush),
+        8 => (0usize..=8, operation()).prop_map(|(node, operation)| {
+            MultiNodeOperation::Node { node, operation }
+        }),
+    ]
+}
+
+fn multi_node_operations() -> impl Strategy<Value = Vec<MultiNodeOperation>> {
+    proptest::collection::vec(multi_node_operation(), 0..=32)
+}
+
 fn cluster_config(config: GeneratedConfig) -> noraft::ClusterConfig {
     noraft::ClusterConfig {
         voters: node_set(config.voters),
@@ -214,25 +250,34 @@ fn initial_state() -> NodeState {
 }
 
 fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operation: Operation) {
+    apply_node_operation(engine, NODE_ID, expected, operation);
+}
+
+fn apply_node_operation(
+    engine: &mut StorageEngine,
+    node_id: noraft::NodeId,
+    expected: &mut NodeState,
+    operation: Operation,
+) {
     match operation {
         Operation::CurrentTerm(term) => {
             let term = noraft::Term::new(term);
             engine
-                .save_current_term(NODE_ID, term)
+                .save_current_term(node_id, term)
                 .expect("term should be stored");
             expected.apply_current_term(term);
         }
         Operation::VotedFor(voted_for) => {
             let voted_for = voted_for.map(noraft::NodeId::new);
             engine
-                .save_voted_for(NODE_ID, voted_for)
+                .save_voted_for(node_id, voted_for)
                 .expect("vote should be stored");
             expected.apply_voted_for(voted_for);
         }
         Operation::Append { anchor, entries } => {
             let append = log_append(choose_position(expected, anchor), entries);
             engine
-                .append_entries(NODE_ID, append.clone())
+                .append_entries(node_id, append.clone())
                 .expect("append should be stored");
             expected
                 .apply_append(&append)
@@ -259,7 +304,7 @@ fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operati
                 suffix,
             };
             engine
-                .save_snapshot(NODE_ID, checkpoint.clone())
+                .save_snapshot(node_id, checkpoint.clone())
                 .expect("snapshot checkpoint should be stored");
 
             expected.current_term = checkpoint.current_term;
@@ -268,6 +313,52 @@ fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operati
                 noraft::Log::new(snapshot.config.clone(), checkpoint.suffix.entries().clone());
             expected.command_payloads = checkpoint.suffix.command_payloads().clone();
             expected.snapshot = Some(snapshot);
+        }
+    }
+}
+
+fn choose_active_node(
+    active: &BTreeMap<noraft::NodeId, NodeState>,
+    choice: usize,
+) -> Option<noraft::NodeId> {
+    if active.is_empty() {
+        return None;
+    }
+    active.keys().copied().nth(choice % active.len())
+}
+
+fn apply_multi_node_operation(
+    engine: &mut StorageEngine,
+    active: &mut BTreeMap<noraft::NodeId, NodeState>,
+    created: &mut BTreeSet<noraft::NodeId>,
+    operation: MultiNodeOperation,
+) {
+    match operation {
+        MultiNodeOperation::Create(node) => {
+            let node_id = noraft::NodeId::new(node);
+            if created.insert(node_id) {
+                engine
+                    .create_node(node_id, NodeMetadata::default())
+                    .expect("node should be created");
+                active.insert(node_id, initial_state());
+            }
+        }
+        MultiNodeOperation::Remove(choice) => {
+            if let Some(node_id) = choose_active_node(active, choice) {
+                engine.remove_node(node_id).expect("node should be removed");
+                active.remove(&node_id);
+            }
+        }
+        MultiNodeOperation::Flush => {
+            engine.flush().expect("flush should succeed");
+        }
+        MultiNodeOperation::Node { node, operation } => {
+            if let Some(node_id) = choose_active_node(active, node) {
+                let expected = active
+                    .get_mut(&node_id)
+                    .expect("chosen active node should exist");
+                apply_node_operation(engine, node_id, expected, operation);
+            }
         }
     }
 }
@@ -305,5 +396,46 @@ proptest! {
         let mut all = engine.load_all().expect("all states should load");
         prop_assert_eq!(all.remove(&NODE_ID), Some(expected));
         prop_assert!(all.is_empty());
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn multi_node_storage_replay_roundtrip(
+        sync in sync_policy(),
+        max_segment_len in 1u64..=512,
+        operations in multi_node_operations(),
+    ) {
+        let dir = TempDir::new("sukari-pbt-multi-node-storage-replay");
+        let mut engine = StorageEngine::with_max_segment_len(
+            dir.path(),
+            sync,
+            max_segment_len,
+        )
+        .expect("storage should open");
+
+        let initial_node = NODE_ID;
+        engine
+            .create_node(initial_node, NodeMetadata::default())
+            .expect("initial node should be created");
+        let mut active = BTreeMap::from([(initial_node, initial_state())]);
+        let mut created = BTreeSet::from([initial_node]);
+
+        for operation in operations {
+            apply_multi_node_operation(&mut engine, &mut active, &mut created, operation);
+        }
+        drop(engine);
+
+        let mut engine =
+            StorageEngine::new(dir.path(), sync).expect("storage should reopen");
+        for (node_id, expected) in &active {
+            let loaded = engine.load(*node_id).expect("node state should load");
+            prop_assert_eq!(&loaded, expected);
+        }
+
+        let all = engine.load_all().expect("all states should load");
+        prop_assert_eq!(all, active);
     }
 }
