@@ -238,15 +238,52 @@ fn log_append(prev_position: noraft::LogPosition, entries: Vec<GeneratedEntry>) 
 }
 
 fn initial_state() -> NodeState {
-    let mut state = NodeState::default();
+    let snapshot = Snapshot {
+        last_included: noraft::LogPosition::ZERO,
+        config: noraft::ClusterConfig::new(),
+        data: Bytes::default(),
+    };
+    NodeState {
+        current_term: noraft::Term::ZERO,
+        voted_for: None,
+        log: noraft::Log::new(
+            snapshot.config.clone(),
+            noraft::LogEntries::new(snapshot.last_included),
+        ),
+        command_payloads: BTreeMap::new(),
+        snapshot: Some(snapshot),
+    }
+}
+
+fn apply_append_to_expected(state: &mut NodeState, append: &LogAppend) -> Result<(), String> {
+    if !state
+        .log
+        .entries()
+        .contains(append.entries().prev_position())
+    {
+        return Err("append anchor does not exist in expected log".to_owned());
+    }
+
+    let keep_len = append.entries().prev_position().index.get()
+        - state.log.entries().prev_position().index.get();
+    let keep_len =
+        usize::try_from(keep_len).map_err(|_| "log suffix length exceeds usize".to_owned())?;
+
+    let mut entries = state.log.entries().clone();
+    entries.truncate(keep_len);
+    for entry in append.entries().iter() {
+        entries.push(entry);
+    }
+    state.log = noraft::Log::new(state.log.snapshot_config().clone(), entries);
+
+    let prev_index = append.entries().prev_position().index;
     state
-        .apply_snapshot(Snapshot {
-            last_included: noraft::LogPosition::ZERO,
-            config: noraft::ClusterConfig::new(),
-            data: Bytes::default(),
-        })
-        .expect("initial snapshot should apply");
+        .command_payloads
+        .retain(|index, _| *index <= prev_index);
     state
+        .command_payloads
+        .extend(append.command_payloads().clone());
+    Ok(())
 }
 
 fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operation: Operation) {
@@ -265,23 +302,21 @@ fn apply_node_operation(
             engine
                 .save_current_term(node_id, term)
                 .expect("term should be stored");
-            expected.apply_current_term(term);
+            expected.current_term = term;
         }
         Operation::VotedFor(voted_for) => {
             let voted_for = voted_for.map(noraft::NodeId::new);
             engine
                 .save_voted_for(node_id, voted_for)
                 .expect("vote should be stored");
-            expected.apply_voted_for(voted_for);
+            expected.voted_for = voted_for;
         }
         Operation::Append { anchor, entries } => {
             let append = log_append(choose_position(expected, anchor), entries);
             engine
                 .append_entries(node_id, append.clone())
                 .expect("append should be stored");
-            expected
-                .apply_append(&append)
-                .expect("generated append should apply");
+            apply_append_to_expected(expected, &append).expect("generated append should apply");
         }
         Operation::SnapshotCheckpoint {
             current_term,

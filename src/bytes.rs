@@ -45,11 +45,6 @@ impl Bytes {
         self.inner.is_empty()
     }
 
-    /// Copies this payload into owned bytes.
-    pub fn into_vec(self) -> Vec<u8> {
-        self.inner.to_vec()
-    }
-
     /// Converts this payload into shared bytes without copying.
     pub fn into_arc(self) -> Arc<[u8]> {
         self.inner

@@ -733,19 +733,12 @@ impl Default for NodeState {
 }
 
 impl NodeState {
-    /// Applies a current-term record to this state.
-    pub fn apply_current_term(&mut self, term: noraft::Term) {
+    fn apply_current_term(&mut self, term: noraft::Term) {
         self.current_term = term;
     }
 
-    /// Applies a voted-for record to this state.
-    pub fn apply_voted_for(&mut self, voted_for: Option<noraft::NodeId>) {
+    fn apply_voted_for(&mut self, voted_for: Option<noraft::NodeId>) {
         self.voted_for = voted_for;
-    }
-
-    /// Applies a log append record to this state.
-    pub fn apply_append(&mut self, append: &LogAppend) -> io::Result<()> {
-        self.apply_append_owned(append.clone())
     }
 
     fn apply_append_owned(&mut self, append: LogAppend) -> io::Result<()> {
@@ -773,8 +766,7 @@ impl NodeState {
         Ok(())
     }
 
-    /// Applies snapshot data to this state.
-    pub fn apply_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
+    fn apply_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
         let current_entries = self.log.entries();
         if snapshot.last_included.index < current_entries.prev_position().index {
             return Err(invalid_data("snapshot is older than the current snapshot"));

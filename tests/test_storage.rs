@@ -1,6 +1,6 @@
 use sukari::{
-    Bytes, CommandPayload, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint,
-    StorageEngine, SyncPolicy,
+    Bytes, CommandPayload, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine,
+    SyncPolicy,
 };
 
 use std::{
@@ -1203,8 +1203,12 @@ fn storage_engine_does_not_collect_after_node_creation() {
 }
 
 #[test]
-fn node_state_applies_log_suffix_replacement() {
-    let mut state = NodeState::default();
+fn storage_engine_replays_log_suffix_replacement() {
+    let dir = unique_temp_dir("sukari-storage-log-suffix-replacement");
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
+    create_node(&mut engine, 1);
+
     let mut commands = BTreeMap::new();
     commands.insert(
         noraft::LogIndex::new(2),
@@ -1225,9 +1229,9 @@ fn node_state_applies_log_suffix_replacement() {
     );
     let initial_append = LogAppend::new(initial_entries, commands)
         .expect("initial append should have matching command payloads");
-    state
-        .apply_append(&initial_append)
-        .expect("initial append should apply");
+    engine
+        .append_entries(noraft::NodeId::new(1), initial_append)
+        .expect("initial append should be stored");
 
     let mut replacement_commands = BTreeMap::new();
     replacement_commands.insert(
@@ -1238,10 +1242,16 @@ fn node_state_applies_log_suffix_replacement() {
         noraft::LogEntries::from_iter(position(1, 1), [noraft::LogEntry::Command]);
     let replacement_append = LogAppend::new(replacement_entries, replacement_commands)
         .expect("replacement append should have matching command payloads");
-    state
-        .apply_append(&replacement_append)
-        .expect("replacement append should apply");
+    engine
+        .append_entries(noraft::NodeId::new(1), replacement_append)
+        .expect("replacement append should be stored");
+    drop(engine);
 
+    let mut engine =
+        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should reopen");
+    let state = engine
+        .load(noraft::NodeId::new(1))
+        .expect("node state should load");
     assert_eq!(state.log.entries().last_position(), position(1, 2));
     assert_eq!(state.command_payloads.len(), 1);
     assert_eq!(
@@ -1252,6 +1262,8 @@ fn node_state_applies_log_suffix_replacement() {
             .expect("replacement payload should exist"),
         b"new-2"
     );
+
+    std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
 
 #[test]

@@ -15,10 +15,3 @@ fn bytes_shares_arc_payloads() {
     let exported: Arc<[u8]> = cloned.into();
     assert!(Arc::ptr_eq(&exported, &shared));
 }
-
-#[test]
-fn bytes_into_vec_returns_owned_payload() {
-    let bytes = Bytes::from(Arc::<[u8]>::from(b"payload".as_slice()));
-
-    assert_eq!(bytes.into_vec(), b"payload");
-}
