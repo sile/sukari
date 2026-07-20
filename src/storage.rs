@@ -142,11 +142,6 @@ impl StorageEngine {
         self.registry.nodes()
     }
 
-    /// Returns active Raft nodes marked for process startup.
-    pub fn startup_nodes(&self) -> impl Iterator<Item = (noraft::NodeId, &NodeMetadata)> + '_ {
-        self.registry.startup_nodes()
-    }
-
     /// Loads the current state for the given Raft node.
     ///
     /// The state is built on demand by replaying segment records. When a valid
@@ -438,17 +433,6 @@ pub fn nodes<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, Node
     Ok(ReadOnlyStorage::open(dir)?
         .registry
         .nodes()
-        .map(|(node_id, metadata)| (node_id, metadata.clone()))
-        .collect())
-}
-
-/// Returns active Raft nodes marked for process startup and their metadata.
-///
-/// The metadata JSON file is read for each call.
-pub fn startup_nodes<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, NodeMetadata>> {
-    Ok(ReadOnlyStorage::open(dir)?
-        .registry
-        .startup_nodes()
         .map(|(node_id, metadata)| (node_id, metadata.clone()))
         .collect())
 }

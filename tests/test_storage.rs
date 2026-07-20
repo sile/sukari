@@ -1,6 +1,6 @@
 use sukari::{
     Bytes, CommandPayload, LogAppend, NodeMetadata, Snapshot, SnapshotCheckpoint, StorageEngine,
-    load, nodes as read_only_nodes, startup_nodes as read_only_startup_nodes,
+    load, nodes as read_only_nodes,
 };
 
 use std::{
@@ -129,15 +129,6 @@ fn read_only_functions_reload_node_metadata() {
             .collect::<Vec<_>>(),
         vec![noraft::NodeId::new(1)]
     );
-    assert_eq!(
-        read_only_startup_nodes(&dir)
-            .expect("startup nodes should load")
-            .keys()
-            .copied()
-            .collect::<Vec<_>>(),
-        Vec::<noraft::NodeId>::new()
-    );
-
     engine
         .remove_node(noraft::NodeId::new(1))
         .expect("node should be removed");
@@ -229,7 +220,8 @@ fn storage_engine_persists_node_registry_metadata() {
     );
     assert_eq!(
         engine
-            .startup_nodes()
+            .nodes()
+            .filter(|(_, metadata)| metadata.startup())
             .map(|(node_id, _)| node_id)
             .collect::<Vec<_>>(),
         vec![noraft::NodeId::new(1)]

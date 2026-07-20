@@ -46,5 +46,5 @@ pub use registry::NodeMetadata;
 pub use stats::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
 pub use storage::{
     CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, load,
-    load_all, nodes, startup_nodes,
+    load_all, nodes,
 };

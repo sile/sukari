@@ -16,7 +16,7 @@ const NODE_REGISTRY_VERSION: u64 = 1;
 
 /// Application-defined metadata for a Raft node.
 ///
-/// The `startup` flag is interpreted by `sukari` for startup discovery.
+/// The `startup` flag is available to callers when selecting nodes to start.
 /// The JSON metadata is stored and returned without application-specific
 /// interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,12 +143,6 @@ impl NodeRegistry {
             .iter()
             .filter(|(_, entry)| !entry.removed)
             .map(|(node_id, entry)| (*node_id, &entry.metadata))
-    }
-
-    pub(crate) fn startup_nodes(
-        &self,
-    ) -> impl Iterator<Item = (noraft::NodeId, &NodeMetadata)> + '_ {
-        self.nodes().filter(|(_, metadata)| metadata.startup())
     }
 
     pub(crate) fn active_node_ids(&self) -> BTreeSet<noraft::NodeId> {

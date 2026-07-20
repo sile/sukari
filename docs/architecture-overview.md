@@ -45,7 +45,7 @@ operations commonly emitted by `noraft`-based runtimes:
 The standard architecture treats `noraft::NodeId` values as globally unique.
 `sukari` routes records by node ID. The node registry belongs in this crate so
 the storage layer can define which node IDs exist in a storage instance and so a
-process can discover startup nodes before loading an external control plane.
+process can inspect startup metadata before loading an external control plane.
 Cluster membership, group placement, and orchestration state stay in the control
 plane above the storage layer.
 
@@ -86,19 +86,18 @@ The crate supports local filesystems only. Network filesystem behavior,
 including file locking, is not supported.
 
 The read-only functions `sukari::load()`, `sukari::load_all()`,
-`sukari::nodes()`, and `sukari::startup_nodes()` do not acquire `write.lock`.
-They can run while a writer is active and never recover, truncate, garbage
-collect, or otherwise modify the directory. Each call reads `nodes.json` and
-`checkpoints.json` again, so node creation and removal become visible to later
-read-only calls. A concurrent read can observe complete records available while
-it runs, but does not provide a point-in-time snapshot.
+and `sukari::nodes()` do not acquire `write.lock`. They can run while a writer
+is active and never recover, truncate, garbage collect, or otherwise modify the
+directory. Each call reads `nodes.json` and `checkpoints.json` again, so node
+creation and removal become visible to later read-only calls. A concurrent read
+can observe complete records available while it runs, but does not provide a
+point-in-time snapshot.
 
 The public API exposes node ID based storage operations on a single engine
 writer:
 
 - create a node with startup metadata
 - inspect active node metadata
-- inspect startup nodes
 - load a node state
 - save current term
 - save voted-for node
@@ -203,9 +202,10 @@ A crash before the rename leaves the previous registry authoritative. A crash
 after the rename makes the `removed` flag authoritative. There is no second
 segment append step for node removal.
 
-The registry is a storage namespace and startup-discovery mechanism. It is not
-the authoritative Raft cluster membership, group placement, or orchestration
-state; those belong to the control plane above `sukari`.
+The registry is a storage namespace. Callers can filter nodes by the `startup`
+flag when they need startup discovery. It is not the authoritative Raft cluster
+membership, group placement, or orchestration state; those belong to the
+control plane above `sukari`.
 
 ## Snapshot Checkpoints
 
