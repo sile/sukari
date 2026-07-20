@@ -55,9 +55,11 @@ pub enum SyncPolicy {
 /// Shared segmented storage engine for registered Raft nodes.
 ///
 /// The engine appends storage records for many nodes into shared append
-/// segments. Node IDs must be registered with [`StorageEngine::create_node`]
-/// before node state records can be written or loaded. Removed node IDs remain
-/// reserved.
+/// segments. A storage directory treats `noraft::NodeId` values as globally
+/// unique across all nodes stored in it. Node IDs must be registered with
+/// [`StorageEngine::create_node`] before node state records can be written or
+/// loaded. Once registered, a node ID remains permanently reserved, even after
+/// [`StorageEngine::remove_node`].
 ///
 /// The engine validates record-local invariants before writing, such as command
 /// payload mappings in [`LogAppend`]. It does not validate a log append against
@@ -90,8 +92,9 @@ impl StorageEngine {
 
     /// Opens or creates a storage engine with a maximum append segment length.
     ///
-    /// If a single record is larger than `max_segment_len`, it is written to an
-    /// empty segment and that segment is allowed to exceed the limit.
+    /// `max_segment_len` is a rotation threshold, not a hard per-record limit.
+    /// If a record frame is larger than `max_segment_len`, it is written to an
+    /// empty segment and that segment is allowed to exceed the threshold.
     pub fn with_max_segment_len<P: AsRef<Path>>(
         dir: P,
         sync: SyncPolicy,
@@ -281,7 +284,7 @@ impl StorageEngine {
     /// Marks the given Raft node as removed and reserves its node ID.
     ///
     /// Removal is persisted in the node registry. No segment record is appended
-    /// for node removal.
+    /// for node removal. The removed node ID cannot be created again.
     pub fn remove_node(&mut self, node_id: noraft::NodeId) -> io::Result<()> {
         self.ensure_node_exists(node_id, StorageOperationKind::RemoveNode)?;
         let mut registry = self.registry.clone();

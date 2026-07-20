@@ -41,10 +41,9 @@ process can discover startup nodes before loading an external control plane.
 Cluster membership, group placement, and orchestration state stay in the control
 plane above the storage layer.
 
-## Current Baseline
+## Storage Layout
 
-The implementation provides a conservative append-only baseline with one active
-shared append segment at a time:
+The implementation uses one active shared append segment at a time:
 
 ```text
 storage/
@@ -59,8 +58,11 @@ decimal segment IDs. Append segment IDs start at `0` and are written without
 zero padding. Startup selects the active append segment by scanning canonical
 append segment file names and opening the greatest segment ID. Non-segment files
 and non-canonical append segment names are ignored. New writes rotate to the next
-append segment when the configured segment length would be exceeded. A single
-record that exceeds the limit is written to an empty segment by itself.
+append segment when the configured segment length would be exceeded. The
+configured length is a rotation threshold, not a hard per-record limit. If a
+record frame is larger than the threshold, the writer rotates once when needed,
+writes the frame to an empty segment, and lets that segment exceed the
+threshold.
 
 The public API exposes node ID based storage operations on a single engine
 writer:

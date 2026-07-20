@@ -1,10 +1,11 @@
-//! Shared segmented Raft log storage for applications that run one or more
-//! local Raft nodes.
+//! Shared segmented Raft log storage for
+//! [`noraft`](https://github.com/sile/noraft)-based applications that run one
+//! or more local Raft nodes.
 //!
-//! `sukari` stores durable records for one or more local Raft nodes in shared
-//! append segment files. It owns the on-disk storage format, recovery, replay,
-//! snapshot checkpoints, node registry metadata, and whole-segment garbage
-//! collection.
+//! `sukari` uses `noraft` protocol types directly and stores durable records
+//! for one or more local Raft nodes in shared append segment files. It owns the
+//! on-disk storage format, recovery, replay, snapshot checkpoints, node
+//! registry metadata, and whole-segment garbage collection.
 //!
 //! A [`StorageEngine`] has one writer. It does not add internal synchronization
 //! for concurrent callers; runtimes that need concurrent access serialize

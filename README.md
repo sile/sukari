@@ -1,16 +1,17 @@
 # sukari
 
-`sukari` is a shared segmented Raft log storage engine for applications that run
-one or more local Raft nodes.
+`sukari` is a shared segmented Raft log storage engine for
+[`noraft`](https://github.com/sile/noraft)-based applications that run one or
+more local Raft nodes.
 
 The name `sukari` refers to a Japanese fishing basket kept in water, evoking a
 small storage container beside a raft.
 
-The crate provides a storage backend for one or more local Raft nodes. When
-multiple nodes share a storage directory, it can batch durable writes into
-shared append-only segment files. Higher-level runtime and control-plane crates
-can use it without taking ownership of shared storage format, replay,
-compaction, and recovery details.
+The crate provides a storage backend that uses `noraft` protocol types
+directly. When multiple nodes share a storage directory, it can batch durable
+writes into shared append-only segment files. Higher-level runtime and
+control-plane crates can use it without taking ownership of shared storage
+format, replay, compaction, and recovery details.
 
 ## Storage Model
 
