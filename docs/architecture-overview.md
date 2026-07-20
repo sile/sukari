@@ -76,7 +76,6 @@ writer:
 - flush pending writes
 - load all non-removed node states
 - remove a node and reserve its node ID
-- remove all storage data
 
 Storage operations for node state fail unless the target node ID has been
 created with `create_node()`. Removed node IDs are permanently reserved and

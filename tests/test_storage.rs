@@ -1858,22 +1858,6 @@ fn storage_engine_rejects_over_limit_record_body_len() {
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
 
-#[test]
-fn storage_engine_removes_all_data() {
-    let dir = unique_temp_dir("sukari-storage-remove-all");
-    let mut engine =
-        StorageEngine::new(&dir, SyncPolicy::UnsafeNoSync).expect("storage should open");
-    create_node(&mut engine, 1);
-    engine
-        .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
-        .expect("term should be stored");
-
-    engine
-        .remove_all()
-        .expect("storage directory should be removed");
-    assert!(!dir.exists());
-}
-
 fn append<const N: usize, I>(
     prev_position: noraft::LogPosition,
     entries: I,

@@ -307,14 +307,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Removes all storage data managed by this engine.
-    ///
-    /// This consumes the engine and deletes the storage directory.
-    pub fn remove_all(self) -> io::Result<()> {
-        drop(self.writer);
-        remove_storage_dir_if_exists(&self.dir, self.sync)
-    }
-
     /// Returns the storage directory.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -2211,31 +2203,4 @@ fn invalid_json(error: nojson::JsonParseError) -> io::Error {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).expect("usize value should fit in u64")
-}
-
-fn remove_storage_dir_if_exists(path: &Path, sync: SyncPolicy) -> io::Result<()> {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    if should_sync_metadata(sync) {
-        sync_dir(path)?;
-    }
-
-    std::fs::remove_dir(path)?;
-    if should_sync_metadata(sync) {
-        sync_parent_dir(path)?;
-    }
-    Ok(())
 }

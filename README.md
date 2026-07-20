@@ -82,7 +82,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = storage.load(node_id)?;
     assert_eq!(state.current_term, noraft::Term::new(1));
 
-    storage.remove_all()?;
     Ok(())
 }
 ```
