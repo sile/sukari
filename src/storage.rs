@@ -68,6 +68,11 @@ pub enum SyncPolicy {
 /// payload mappings in [`LogAppend`]. It does not validate a log append against
 /// the node's currently loaded log before writing. Replay applies records in
 /// append order and resolves divergent log suffixes.
+///
+/// Storage write and metadata persistence errors are fatal to the engine
+/// instance. After such an error, callers should stop using the instance,
+/// diagnose the storage state, and reopen only after choosing an appropriate
+/// recovery action.
 #[derive(Debug)]
 pub struct StorageEngine {
     dir: PathBuf,

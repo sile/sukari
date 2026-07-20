@@ -24,6 +24,10 @@ the storage layer validates record-local invariants, but it does not load the
 node state to validate log append anchors before writing. Replay applies records
 in append order and resolves divergent log suffixes.
 
+Storage write and metadata persistence errors are fatal to the engine instance.
+Callers should stop using that instance and diagnose the storage state before
+reopening it.
+
 Snapshots are saved as checkpoints. A checkpoint contains the current term,
 voted-for node, latest snapshot, and retained log suffix. Earlier records for
 the node become obsolete for replay and whole-segment garbage collection.

@@ -97,6 +97,12 @@ loaded log before writing. Divergent log suffixes caused by leader changes are
 reconciled by deterministic replay, which applies records in their original
 append order.
 
+Storage write and metadata persistence errors are fatal to the engine instance.
+They are not treated as per-record retryable errors because storage failure can
+affect Raft durability. After such an error, callers should stop using the
+instance, diagnose the storage state, and reopen only after choosing an
+appropriate recovery action.
+
 Command payload tags are persisted and replayed without interpretation. Their
 meaning belongs to the caller.
 
