@@ -600,6 +600,25 @@ impl Default for NodeState {
     }
 }
 
+fn retained_log_entries_after_snapshot(
+    entries: &noraft::LogEntries,
+    snapshot_position: noraft::LogPosition,
+) -> io::Result<noraft::LogEntries> {
+    if snapshot_position.index < entries.prev_position().index {
+        return Err(invalid_data("snapshot is older than the current snapshot"));
+    }
+
+    if let Some(entries) = entries.since(snapshot_position) {
+        return Ok(entries);
+    }
+
+    if entries.last_position().index < snapshot_position.index {
+        return Ok(noraft::LogEntries::new(snapshot_position));
+    }
+
+    Err(invalid_data("snapshot position conflicts with local log"))
+}
+
 impl NodeState {
     fn apply_current_term(&mut self, term: noraft::Term) {
         self.current_term = term;
@@ -635,22 +654,8 @@ impl NodeState {
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
-        let current_entries = self.log.entries();
-        if snapshot.last_included.index < current_entries.prev_position().index {
-            return Err(invalid_data("snapshot is older than the current snapshot"));
-        }
-
-        let entries = if let Some(entries) = current_entries.since(snapshot.last_included) {
-            entries
-        } else if current_entries.last_position().index < snapshot.last_included.index {
-            noraft::LogEntries::new(snapshot.last_included)
-        } else {
-            return Err(invalid_data("snapshot position conflicts with local log"));
-        };
-
-        if entries.prev_position() != snapshot.last_included {
-            return Err(invalid_data("invalid snapshot log suffix"));
-        }
+        let entries =
+            retained_log_entries_after_snapshot(self.log.entries(), snapshot.last_included)?;
 
         self.command_payloads
             .retain(|index, _| snapshot.last_included.index < *index);
