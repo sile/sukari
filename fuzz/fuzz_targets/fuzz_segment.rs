@@ -7,7 +7,7 @@ use std::{
 };
 
 use libfuzzer_sys::fuzz_target;
-use sukari::{StorageEngine, SyncPolicy};
+use sukari::StorageEngine;
 
 const SEGMENT_FILE_NAME: &str = "append-0.segment";
 const NODE_REGISTRY_FILE_NAME: &str = "nodes.json";
@@ -76,7 +76,7 @@ fn exercise_segment(segment: &[u8]) {
         return;
     }
 
-    let Ok(mut engine) = StorageEngine::new(dir.path(), SyncPolicy::UnsafeNoSync) else {
+    let Ok(mut engine) = StorageEngine::new(dir.path()) else {
         return;
     };
     let _ = engine.load_all();
