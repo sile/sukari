@@ -298,12 +298,12 @@ complicates the runtime for little gain.
 
 ## Observability
 
-`sukari` exposes detailed storage statistics without depending on a metrics
+`sukari` exposes detailed storage metrics without depending on a metrics
 backend or async runtime. The storage crate keeps cheap typed counters and
 gauges internally, but it does not expose a generic metric-entry or
 backend-specific API.
 
-The typed stats snapshot covers:
+The typed metrics snapshot covers:
 
 - segment records written and replayed
 - bytes written and replayed
@@ -314,13 +314,13 @@ The typed stats snapshot covers:
 - snapshot checkpoints and whole-segment garbage collection
 
 Update paths use typed counters so normal storage operations do not allocate
-strings or perform map lookups. `StorageEngine::stats()` returns a reference to
+strings or perform map lookups. `StorageEngine::metrics()` returns a reference to
 the current storage counters and gauges. Runtime integration crates can combine
 that view with transport metrics, add deployment labels, and convert the result
 to Prometheus text or another scrape format.
 
 Metric names and labels belong at the runtime integration boundary. If an
-integration exports these stats, it should use a crate-specific prefix such as
+integration exports these metrics, it should use a crate-specific prefix such as
 `sukari_` and keep labels low-cardinality. Useful dimensions include operation
 kind, record kind, and error kind. Segment IDs, log indexes, request IDs, and
 stream IDs are not labels.

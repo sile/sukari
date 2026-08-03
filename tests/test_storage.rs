@@ -298,13 +298,13 @@ fn storage_engine_rejects_uncreated_nodes() {
 }
 
 #[test]
-fn storage_engine_reports_typed_stats() {
-    let dir = unique_temp_dir("sukari-storage-stats");
+fn storage_engine_reports_typed_metrics() {
+    let dir = unique_temp_dir("sukari-storage-metrics");
     let mut engine = StorageEngine::with_max_segment_len(&dir, 1).expect("storage should open");
 
-    let initial_stats = engine.stats();
-    assert_eq!(initial_stats.active_nodes, 0);
-    assert_eq!(initial_stats.active_append_segment_id, 0);
+    let initial_metrics = engine.metrics();
+    assert_eq!(initial_metrics.active_nodes, 0);
+    assert_eq!(initial_metrics.active_append_segment_id, 0);
 
     create_node(&mut engine, 1);
     engine
@@ -339,40 +339,40 @@ fn storage_engine_reports_typed_stats() {
         .expect("checkpoint should be stored");
     engine.sync().expect("sync should succeed");
 
-    let stats = engine.stats();
-    assert_eq!(stats.records_written.current_term, 1);
-    assert_eq!(stats.records_written.voted_for, 1);
-    assert_eq!(stats.records_written.log_append, 1);
-    assert_eq!(stats.records_written.snapshot_checkpoint, 2);
-    assert!(0 < stats.bytes_written.current_term);
-    assert!(0 < stats.bytes_written.snapshot_checkpoint);
-    assert_eq!(stats.nodes_created, 1);
-    assert_eq!(stats.snapshot_checkpoints_saved, 1);
-    assert_eq!(stats.segment_rotations, 4);
-    assert_eq!(stats.syncs, 1);
-    assert_eq!(stats.durable_syncs, 6);
-    assert_eq!(stats.gc_runs, 1);
-    assert_eq!(stats.gc_segments_deleted, 4);
-    assert_eq!(stats.active_nodes, 1);
-    assert_eq!(stats.removed_nodes, 0);
-    assert_eq!(stats.checkpoint_index_nodes, 1);
-    assert_eq!(stats.active_append_segment_id, 4);
-    assert!(0 < stats.active_append_segment_len_bytes);
-    assert_eq!(stats.records_replayed.snapshot_checkpoint, 0);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.records_written.current_term, 1);
+    assert_eq!(metrics.records_written.voted_for, 1);
+    assert_eq!(metrics.records_written.log_append, 1);
+    assert_eq!(metrics.records_written.snapshot_checkpoint, 2);
+    assert!(0 < metrics.bytes_written.current_term);
+    assert!(0 < metrics.bytes_written.snapshot_checkpoint);
+    assert_eq!(metrics.nodes_created, 1);
+    assert_eq!(metrics.snapshot_checkpoints_saved, 1);
+    assert_eq!(metrics.segment_rotations, 4);
+    assert_eq!(metrics.syncs, 1);
+    assert_eq!(metrics.durable_syncs, 6);
+    assert_eq!(metrics.gc_runs, 1);
+    assert_eq!(metrics.gc_segments_deleted, 4);
+    assert_eq!(metrics.active_nodes, 1);
+    assert_eq!(metrics.removed_nodes, 0);
+    assert_eq!(metrics.checkpoint_index_nodes, 1);
+    assert_eq!(metrics.active_append_segment_id, 4);
+    assert!(0 < metrics.active_append_segment_len_bytes);
+    assert_eq!(metrics.records_replayed.snapshot_checkpoint, 0);
 
     engine
         .load(noraft::NodeId::new(1))
         .expect("node state should load");
-    let stats = engine.stats();
-    assert_eq!(stats.records_replayed.snapshot_checkpoint, 1);
-    assert!(0 < stats.bytes_replayed.snapshot_checkpoint);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.records_replayed.snapshot_checkpoint, 1);
+    assert!(0 < metrics.bytes_replayed.snapshot_checkpoint);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
 
 #[test]
-fn storage_engine_reports_rejected_operation_stats() {
-    let dir = unique_temp_dir("sukari-storage-rejected-stats");
+fn storage_engine_reports_rejected_operation_metrics() {
+    let dir = unique_temp_dir("sukari-storage-rejected-metrics");
     let mut engine = StorageEngine::new(&dir).expect("storage should open");
 
     let unknown_node = noraft::NodeId::new(1);
@@ -406,13 +406,16 @@ fn storage_engine_reports_rejected_operation_stats() {
         .remove_node(unknown_node)
         .expect_err("unknown node should not be removed");
 
-    let stats = engine.stats();
-    assert_eq!(stats.rejected_operations.unknown_nodes.load, 1);
-    assert_eq!(stats.rejected_operations.unknown_nodes.save_current_term, 1);
-    assert_eq!(stats.rejected_operations.unknown_nodes.save_voted_for, 1);
-    assert_eq!(stats.rejected_operations.unknown_nodes.append_entries, 1);
-    assert_eq!(stats.rejected_operations.unknown_nodes.save_snapshot, 1);
-    assert_eq!(stats.rejected_operations.unknown_nodes.remove_node, 1);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.rejected_operations.unknown_nodes.load, 1);
+    assert_eq!(
+        metrics.rejected_operations.unknown_nodes.save_current_term,
+        1
+    );
+    assert_eq!(metrics.rejected_operations.unknown_nodes.save_voted_for, 1);
+    assert_eq!(metrics.rejected_operations.unknown_nodes.append_entries, 1);
+    assert_eq!(metrics.rejected_operations.unknown_nodes.save_snapshot, 1);
+    assert_eq!(metrics.rejected_operations.unknown_nodes.remove_node, 1);
 
     let removed_node = noraft::NodeId::new(2);
     create_node(&mut engine, 2);
@@ -443,44 +446,44 @@ fn storage_engine_reports_rejected_operation_stats() {
         .remove_node(removed_node)
         .expect_err("removed node should not be removed again");
 
-    let stats = engine.stats();
-    assert_eq!(stats.nodes_removed, 1);
-    assert_eq!(stats.active_nodes, 0);
-    assert_eq!(stats.removed_nodes, 1);
-    assert_eq!(stats.rejected_operations.removed_nodes.load, 1);
-    assert_eq!(stats.rejected_operations.removed_nodes.append_entries, 1);
-    assert_eq!(stats.rejected_operations.removed_nodes.save_snapshot, 1);
-    assert_eq!(stats.rejected_operations.removed_nodes.remove_node, 1);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.nodes_removed, 1);
+    assert_eq!(metrics.active_nodes, 0);
+    assert_eq!(metrics.removed_nodes, 1);
+    assert_eq!(metrics.rejected_operations.removed_nodes.load, 1);
+    assert_eq!(metrics.rejected_operations.removed_nodes.append_entries, 1);
+    assert_eq!(metrics.rejected_operations.removed_nodes.save_snapshot, 1);
+    assert_eq!(metrics.rejected_operations.removed_nodes.remove_node, 1);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }
 
 #[test]
-fn storage_engine_reports_sync_stats() {
-    let dir = unique_temp_dir("sukari-storage-sync-stats");
+fn storage_engine_reports_sync_metrics() {
+    let dir = unique_temp_dir("sukari-storage-sync-metrics");
     let mut engine = StorageEngine::new(&dir).expect("storage should open");
 
     create_node(&mut engine, 1);
-    let stats = engine.stats();
-    assert_eq!(stats.durable_syncs, 1);
-    assert_eq!(stats.syncs, 0);
-    assert_eq!(stats.unsynced_records, 0);
-    assert_eq!(stats.unsynced_bytes, 0);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.durable_syncs, 1);
+    assert_eq!(metrics.syncs, 0);
+    assert_eq!(metrics.unsynced_records, 0);
+    assert_eq!(metrics.unsynced_bytes, 0);
 
     engine
         .save_current_term(noraft::NodeId::new(1), noraft::Term::new(1))
         .expect("term should be stored");
-    let stats = engine.stats();
-    assert_eq!(stats.durable_syncs, 1);
-    assert_eq!(stats.unsynced_records, 1);
-    assert!(0 < stats.unsynced_bytes);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.durable_syncs, 1);
+    assert_eq!(metrics.unsynced_records, 1);
+    assert!(0 < metrics.unsynced_bytes);
 
     engine.sync().expect("sync should succeed");
-    let stats = engine.stats();
-    assert_eq!(stats.durable_syncs, 2);
-    assert_eq!(stats.syncs, 1);
-    assert_eq!(stats.unsynced_records, 0);
-    assert_eq!(stats.unsynced_bytes, 0);
+    let metrics = engine.metrics();
+    assert_eq!(metrics.durable_syncs, 2);
+    assert_eq!(metrics.syncs, 1);
+    assert_eq!(metrics.unsynced_records, 0);
+    assert_eq!(metrics.unsynced_bytes, 0);
 
     std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
 }

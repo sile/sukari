@@ -36,14 +36,16 @@ mod bytes;
 mod codec;
 mod crc32c;
 mod error;
+mod metrics;
 mod registry;
 mod segment;
-mod stats;
 mod storage;
 
 pub use bytes::Bytes;
+pub use metrics::{
+    OperationKindMetrics, RecordKindMetrics, RejectedOperationMetrics, StorageMetrics,
+};
 pub use registry::NodeMetadata;
-pub use stats::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
 pub use storage::{
     CommandPayload, LogAppend, NodeState, Snapshot, SnapshotCheckpoint, StorageEngine, load,
     load_all, nodes,

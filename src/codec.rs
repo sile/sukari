@@ -1,7 +1,7 @@
 use crate::bytes::Bytes;
 use crate::crc32c::{Crc32c, crc32c};
 use crate::error::{invalid_data, invalid_input};
-use crate::stats::StorageStatsCounters;
+use crate::metrics::StorageMetricsCounters;
 use crate::storage::{CommandPayload, LogAppend, NodeRecord, Record, Snapshot, SnapshotCheckpoint};
 
 use std::{
@@ -37,7 +37,7 @@ pub(crate) fn encode_record_frame(node_id: noraft::NodeId, record: &Record) -> i
 
 pub(crate) fn read_record_body(
     file: &mut File,
-    stats: Option<&mut StorageStatsCounters>,
+    metrics: Option<&mut StorageMetricsCounters>,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
@@ -68,8 +68,8 @@ pub(crate) fn read_record_body(
 
     let actual_checksum = crc32c(&body);
     if actual_checksum != expected_checksum {
-        if let Some(stats) = stats {
-            stats.checksum_failed();
+        if let Some(metrics) = metrics {
+            metrics.checksum_failed();
         }
         return Err(invalid_data("segment record checksum mismatch"));
     }
@@ -78,7 +78,7 @@ pub(crate) fn read_record_body(
 
 pub(crate) fn scan_record_frame(
     file: &mut File,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<Option<()>> {
     let mut header = [0; SEGMENT_RECORD_BASE_HEADER_LEN];
     match file.read_exact(&mut header) {
@@ -116,7 +116,7 @@ pub(crate) fn scan_record_frame(
     }
 
     if crc.value() != expected_checksum {
-        stats.checksum_failed();
+        metrics.checksum_failed();
         return Err(invalid_data("segment record checksum mismatch"));
     }
 

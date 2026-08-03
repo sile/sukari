@@ -1,6 +1,6 @@
 use crate::codec::encode_record_frame;
 use crate::error::{invalid_data, invalid_input};
-use crate::stats::StorageStatsCounters;
+use crate::metrics::StorageMetricsCounters;
 use crate::storage::{Record, sync_parent_dir};
 
 use std::{
@@ -29,7 +29,7 @@ impl SegmentWriter {
         dir: &Path,
         active_segment: SegmentName,
         max_segment_len: u64,
-        stats: &mut StorageStatsCounters,
+        metrics: &mut StorageMetricsCounters,
     ) -> io::Result<Self> {
         let segment_path = active_segment.path(dir);
         let file_existed = segment_path.exists();
@@ -38,7 +38,7 @@ impl SegmentWriter {
             sync_parent_dir(&segment_path)?;
         }
         let segment_len = file.seek(SeekFrom::End(0))?;
-        stats.segment_opened(active_segment.id(), segment_len);
+        metrics.segment_opened(active_segment.id(), segment_len);
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -53,13 +53,13 @@ impl SegmentWriter {
         &mut self,
         node_id: noraft::NodeId,
         record: &Record,
-        stats: &mut StorageStatsCounters,
+        metrics: &mut StorageMetricsCounters,
     ) -> io::Result<RecordPosition> {
         let frame = encode_record_frame(node_id, record)?;
         let written_bytes =
             u64::try_from(frame.len()).map_err(|_| invalid_input("record is too large"))?;
         if self.should_rotate(written_bytes) {
-            self.rotate(stats)?;
+            self.rotate(metrics)?;
         }
         let record_position = RecordPosition {
             segment: self.active_segment,
@@ -70,14 +70,14 @@ impl SegmentWriter {
             .segment_len
             .checked_add(written_bytes)
             .ok_or_else(|| invalid_data("segment length overflow"))?;
-        stats.record_written(record.metric_kind(), written_bytes);
-        stats.segment_written(self.segment_len);
+        metrics.record_written(record.metric_kind(), written_bytes);
+        metrics.segment_written(self.segment_len);
         Ok(record_position)
     }
 
-    pub(crate) fn sync(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        if stats.as_ref().unsynced_records != 0 || stats.as_ref().unsynced_bytes != 0 {
-            self.sync_current_segment(stats)?;
+    pub(crate) fn sync(&mut self, metrics: &mut StorageMetricsCounters) -> io::Result<()> {
+        if metrics.as_ref().unsynced_records != 0 || metrics.as_ref().unsynced_bytes != 0 {
+            self.sync_current_segment(metrics)?;
         }
         Ok(())
     }
@@ -95,8 +95,8 @@ impl SegmentWriter {
             .is_none_or(|len| self.max_segment_len < len)
     }
 
-    fn rotate(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
-        self.sync_current_segment(stats)?;
+    fn rotate(&mut self, metrics: &mut StorageMetricsCounters) -> io::Result<()> {
+        self.sync_current_segment(metrics)?;
         let next_segment = self.active_segment.next_append()?;
         let segment_path = next_segment.path(&self.dir);
         let file = create_active_segment_file(&segment_path)?;
@@ -105,13 +105,13 @@ impl SegmentWriter {
         self.active_segment = next_segment;
         self.file = file;
         self.segment_len = SEGMENT_FILE_HEADER_LEN_U64;
-        stats.segment_rotated(self.active_segment.id(), self.segment_len);
+        metrics.segment_rotated(self.active_segment.id(), self.segment_len);
         Ok(())
     }
 
-    fn sync_current_segment(&mut self, stats: &mut StorageStatsCounters) -> io::Result<()> {
+    fn sync_current_segment(&mut self, metrics: &mut StorageMetricsCounters) -> io::Result<()> {
         self.file.sync_data()?;
-        stats.segment_synced();
+        metrics.segment_synced();
         Ok(())
     }
 }
@@ -242,7 +242,7 @@ pub(crate) fn read_segment_header(
     file: &mut File,
     allow_partial: bool,
     recover_partial: bool,
-    stats: Option<&mut StorageStatsCounters>,
+    metrics: Option<&mut StorageMetricsCounters>,
 ) -> io::Result<bool> {
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
@@ -254,16 +254,16 @@ pub(crate) fn read_segment_header(
     }
     if file_len < SEGMENT_FILE_HEADER_LEN_U64 {
         if allow_partial && recover_partial {
-            if let Some(stats) = stats {
-                stats.replay_truncated();
+            if let Some(metrics) = metrics {
+                metrics.replay_truncated();
             }
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             return Ok(false);
         }
         if allow_partial {
-            if let Some(stats) = stats {
-                stats.replay_truncated();
+            if let Some(metrics) = metrics {
+                metrics.replay_truncated();
             }
             return Ok(false);
         }

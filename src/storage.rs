@@ -6,13 +6,14 @@ use crate::codec::{
     scan_record_frame,
 };
 use crate::error::{invalid_data, invalid_input, invalid_json, usize_to_u64};
+use crate::metrics::{
+    NodeAccessErrorKind, RecordKindMetric, StorageMetrics, StorageMetricsCounters,
+    StorageOperationKind,
+};
 use crate::registry::{NodeMetadata, NodeRegistry, node_not_found_error, node_removed_error};
 use crate::segment::{
     RecordPosition, SEGMENT_FILE_HEADER_LEN_U64, SegmentName, SegmentPath, SegmentWriter,
     discover_segment_paths, read_segment_header, segment_file_exists, select_active_append_segment,
-};
-use crate::stats::{
-    NodeAccessErrorKind, RecordKindMetric, StorageOperationKind, StorageStats, StorageStatsCounters,
 };
 
 use std::{
@@ -51,7 +52,7 @@ const WRITE_LOCK_FILE_NAME: &str = "write.lock";
 pub struct StorageEngine {
     dir: PathBuf,
     _write_lock: File,
-    stats: StorageStatsCounters,
+    metrics: StorageMetricsCounters,
     registry: NodeRegistry,
     checkpoint_index: CheckpointIndex,
     writer: SegmentWriter,
@@ -81,20 +82,20 @@ impl StorageEngine {
         create_dir_all_synced(&dir)?;
         let write_lock = acquire_write_lock(&dir)?;
         let active_segment = select_active_append_segment(&dir)?;
-        let mut stats = StorageStatsCounters::default();
-        recover_storage_dir(&dir, active_segment, &mut stats)?;
+        let mut metrics = StorageMetricsCounters::default();
+        recover_storage_dir(&dir, active_segment, &mut metrics)?;
         let registry = NodeRegistry::load(&dir)?;
         let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
-        stats.registry_loaded(
+        metrics.registry_loaded(
             usize_to_u64(registry.active_node_count()),
             usize_to_u64(registry.removed_node_count()),
         );
-        stats.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
-        let writer = SegmentWriter::open(&dir, active_segment, max_segment_len, &mut stats)?;
+        metrics.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
+        let writer = SegmentWriter::open(&dir, active_segment, max_segment_len, &mut metrics)?;
         Ok(Self {
             dir,
             _write_lock: write_lock,
-            stats,
+            metrics,
             registry,
             checkpoint_index,
             writer,
@@ -116,9 +117,9 @@ impl StorageEngine {
         let append = self.writer.append(
             node_id,
             &Record::SnapshotCheckpoint(initial_checkpoint()),
-            &mut self.stats,
+            &mut self.metrics,
         )?;
-        self.writer.sync(&mut self.stats)?;
+        self.writer.sync(&mut self.metrics)?;
 
         let mut checkpoint_index = self.checkpoint_index.clone();
         checkpoint_index.set_checkpoint_position(node_id, append);
@@ -126,9 +127,9 @@ impl StorageEngine {
         registry.save(&self.dir)?;
         self.registry = registry;
         self.checkpoint_index = checkpoint_index;
-        self.stats.node_created();
-        self.refresh_registry_stats();
-        self.refresh_checkpoint_index_stats();
+        self.metrics.node_created();
+        self.refresh_registry_metrics();
+        self.refresh_checkpoint_index_metrics();
         Ok(())
     }
 
@@ -156,7 +157,7 @@ impl StorageEngine {
             node_id,
             checkpoint_position,
             true,
-            &mut self.stats,
+            &mut self.metrics,
         )
     }
 
@@ -178,7 +179,7 @@ impl StorageEngine {
             Some(&active_node_ids),
             checkpoint_hints,
             true,
-            &mut self.stats,
+            &mut self.metrics,
         )?;
         let mut nodes = BTreeMap::new();
         for node_id in active_node_ids {
@@ -242,17 +243,17 @@ impl StorageEngine {
         let append = self.writer.append(
             node_id,
             &Record::SnapshotCheckpoint(checkpoint),
-            &mut self.stats,
+            &mut self.metrics,
         )?;
-        self.writer.sync(&mut self.stats)?;
+        self.writer.sync(&mut self.metrics)?;
 
         let mut checkpoint_index = self.checkpoint_index.clone();
         checkpoint_index.set_checkpoint_position(node_id, append);
         checkpoint_index.save(&self.dir)?;
         self.checkpoint_index = checkpoint_index;
-        self.refresh_checkpoint_index_stats();
+        self.refresh_checkpoint_index_metrics();
         self.collect_garbage()?;
-        self.stats.snapshot_checkpoint_saved();
+        self.metrics.snapshot_checkpoint_saved();
         Ok(())
     }
 
@@ -272,9 +273,9 @@ impl StorageEngine {
         checkpoint_index.save(&self.dir)?;
         self.checkpoint_index = checkpoint_index;
         self.collect_garbage()?;
-        self.stats.node_removed();
-        self.refresh_registry_stats();
-        self.refresh_checkpoint_index_stats();
+        self.metrics.node_removed();
+        self.refresh_registry_metrics();
+        self.refresh_checkpoint_index_metrics();
         Ok(())
     }
 
@@ -292,8 +293,8 @@ impl StorageEngine {
     /// records referenced from `checkpoints.json` are synchronized internally.
     /// Calling this method with no pending appends is valid.
     pub fn sync(&mut self) -> io::Result<()> {
-        self.stats.sync_requested();
-        self.writer.sync(&mut self.stats)?;
+        self.metrics.sync_requested();
+        self.writer.sync(&mut self.metrics)?;
         Ok(())
     }
 
@@ -302,9 +303,9 @@ impl StorageEngine {
         &self.dir
     }
 
-    /// Returns storage statistics since this engine was opened.
-    pub fn stats(&self) -> &StorageStats {
-        self.stats.as_ref()
+    /// Returns storage metrics since this engine was opened.
+    pub fn metrics(&self) -> &StorageMetrics {
+        self.metrics.as_ref()
     }
 
     fn save_record(
@@ -314,7 +315,7 @@ impl StorageEngine {
         operation: StorageOperationKind,
     ) -> io::Result<()> {
         self.ensure_node_exists(node_id, operation)?;
-        self.writer.append(node_id, &record, &mut self.stats)?;
+        self.writer.append(node_id, &record, &mut self.metrics)?;
         Ok(())
     }
 
@@ -327,17 +328,17 @@ impl StorageEngine {
             return Ok(());
         }
         if self.registry.is_removed(node_id) {
-            self.stats
+            self.metrics
                 .rejected_operation(operation, NodeAccessErrorKind::RemovedNode);
             return Err(node_removed_error());
         }
-        self.stats
+        self.metrics
             .rejected_operation(operation, NodeAccessErrorKind::UnknownNode);
         Err(node_not_found_error())
     }
 
     fn collect_garbage(&mut self) -> io::Result<()> {
-        self.stats.gc_ran();
+        self.metrics.gc_ran();
         let active_node_ids = self.registry.active_node_ids();
         let Some(barrier) = self.checkpoint_index.gc_barrier(&active_node_ids) else {
             return Ok(());
@@ -360,7 +361,7 @@ impl StorageEngine {
         }
 
         if deleted_segments != 0 {
-            self.stats.gc_deleted_segments(deleted_segments);
+            self.metrics.gc_deleted_segments(deleted_segments);
         }
         if deleted_segments != 0 {
             sync_dir(&self.dir)?;
@@ -368,15 +369,15 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn refresh_registry_stats(&mut self) {
-        self.stats.node_counts_changed(
+    fn refresh_registry_metrics(&mut self) {
+        self.metrics.node_counts_changed(
             usize_to_u64(self.registry.active_node_count()),
             usize_to_u64(self.registry.removed_node_count()),
         );
     }
 
-    fn refresh_checkpoint_index_stats(&mut self) {
-        self.stats
+    fn refresh_checkpoint_index_metrics(&mut self) {
+        self.metrics
             .checkpoint_index_changed(usize_to_u64(self.checkpoint_index.len()));
     }
 }
@@ -440,7 +441,7 @@ pub fn nodes<P: AsRef<Path>>(dir: P) -> io::Result<BTreeMap<noraft::NodeId, Node
 #[derive(Debug)]
 struct ReadOnlyStorage {
     dir: PathBuf,
-    stats: StorageStatsCounters,
+    metrics: StorageMetricsCounters,
     registry: NodeRegistry,
     checkpoint_index: CheckpointIndex,
 }
@@ -452,17 +453,17 @@ impl ReadOnlyStorage {
             return Err(invalid_input("storage path is not a directory"));
         }
 
-        let mut stats = StorageStatsCounters::default();
+        let mut metrics = StorageMetricsCounters::default();
         let registry = NodeRegistry::load(&dir)?;
         let checkpoint_index = CheckpointIndex::load(&dir, &registry)?;
-        stats.registry_loaded(
+        metrics.registry_loaded(
             usize_to_u64(registry.active_node_count()),
             usize_to_u64(registry.removed_node_count()),
         );
-        stats.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
+        metrics.checkpoint_index_loaded(usize_to_u64(checkpoint_index.len()));
         Ok(Self {
             dir,
-            stats,
+            metrics,
             registry,
             checkpoint_index,
         })
@@ -477,7 +478,7 @@ impl ReadOnlyStorage {
             node_id,
             checkpoint_position,
             false,
-            &mut self.stats,
+            &mut self.metrics,
         )
     }
 
@@ -494,7 +495,7 @@ impl ReadOnlyStorage {
             Some(&active_node_ids),
             checkpoint_hints,
             false,
-            &mut self.stats,
+            &mut self.metrics,
         )?;
         let mut nodes = BTreeMap::new();
         for node_id in active_node_ids {
@@ -1069,7 +1070,7 @@ fn replay_node_state(
     node_id: noraft::NodeId,
     checkpoint_hint: Option<RecordPosition>,
     recover_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<NodeState> {
     let mut target_nodes = BTreeSet::new();
     target_nodes.insert(node_id);
@@ -1079,7 +1080,7 @@ fn replay_node_state(
         Some(&target_nodes),
         checkpoint_hint,
         recover_partial,
-        stats,
+        metrics,
     )?;
     let checkpoint_position = checkpoint_positions.get(&node_id).copied();
 
@@ -1098,7 +1099,7 @@ fn replay_node_state(
             checkpoint_position,
             recover_partial,
             &mut state,
-            stats,
+            metrics,
         )?;
     }
     Ok(state)
@@ -1110,7 +1111,7 @@ fn replay_storage_dir(
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
     recover_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<ReplayState> {
     let (checkpoint_positions, replay_start_segment) = checkpoint_positions_for_replay(
         dir,
@@ -1118,7 +1119,7 @@ fn replay_storage_dir(
         node_filter,
         checkpoint_hints,
         recover_partial,
-        stats,
+        metrics,
     )?;
     let mut replay = ReplayState::default();
     let segments = discover_segment_paths(dir)?;
@@ -1135,7 +1136,7 @@ fn replay_storage_dir(
             &checkpoint_positions,
             recover_partial,
             &mut replay,
-            stats,
+            metrics,
         )?;
     }
     Ok(replay)
@@ -1147,14 +1148,20 @@ fn checkpoint_positions_for_replay(
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     checkpoint_hints: Option<BTreeMap<noraft::NodeId, RecordPosition>>,
     recover_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<(
     BTreeMap<noraft::NodeId, RecordPosition>,
     Option<SegmentName>,
 )> {
     let Some(mut checkpoint_positions) = checkpoint_hints else {
-        return find_checkpoint_positions(dir, active_segment, node_filter, recover_partial, stats)
-            .map(|positions| (positions, None));
+        return find_checkpoint_positions(
+            dir,
+            active_segment,
+            node_filter,
+            recover_partial,
+            metrics,
+        )
+        .map(|positions| (positions, None));
     };
 
     let Some(start_position) = checkpoint_positions.values().copied().min() else {
@@ -1166,7 +1173,7 @@ fn checkpoint_positions_for_replay(
         node_filter,
         Some(start_position),
         recover_partial,
-        stats,
+        metrics,
     )?;
     checkpoint_positions.extend(discovered);
     Ok((checkpoint_positions, Some(start_position.segment)))
@@ -1175,11 +1182,11 @@ fn checkpoint_positions_for_replay(
 fn recover_storage_dir(
     dir: &Path,
     active_segment: SegmentName,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<()> {
     for segment in discover_segment_paths(dir)? {
         let allow_partial = segment.name == active_segment;
-        scan_segment(&segment.path, allow_partial, stats)?;
+        scan_segment(&segment.path, allow_partial, metrics)?;
     }
     Ok(())
 }
@@ -1189,7 +1196,7 @@ fn find_checkpoint_positions(
     active_segment: SegmentName,
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     recover_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
     find_checkpoint_positions_from(
         dir,
@@ -1197,7 +1204,7 @@ fn find_checkpoint_positions(
         node_filter,
         None,
         recover_partial,
-        stats,
+        metrics,
     )
 }
 
@@ -1207,7 +1214,7 @@ fn find_checkpoint_positions_from(
     node_filter: Option<&BTreeSet<noraft::NodeId>>,
     start_position: Option<RecordPosition>,
     recover_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<BTreeMap<noraft::NodeId, RecordPosition>> {
     let mut checkpoints = BTreeMap::new();
     let segments = discover_segment_paths(dir)?;
@@ -1227,7 +1234,7 @@ fn find_checkpoint_positions_from(
             start_offset,
             recover_partial,
             &mut checkpoints,
-            stats,
+            metrics,
         )?;
     }
     Ok(checkpoints)
@@ -1254,13 +1261,18 @@ fn scan_checkpoint_positions(
     start_offset: Option<u64>,
     recover_partial: bool,
     checkpoints: &mut BTreeMap<noraft::NodeId, RecordPosition>,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
+    if !read_segment_header(
+        &mut file,
+        allow_partial,
+        recover_partial,
+        Some(&mut *metrics),
+    )? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
@@ -1277,12 +1289,12 @@ fn scan_checkpoint_positions(
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file, Some(&mut *stats))? else {
+        let Some(body) = read_record_body(&mut file, Some(&mut *metrics))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
-                stats.replay_truncated();
+                metrics.replay_truncated();
                 if recover_partial {
                     file.set_len(record_start)?;
                     file.seek(SeekFrom::Start(record_start))?;
@@ -1317,25 +1329,30 @@ fn replay_segment(
     checkpoint_positions: &BTreeMap<noraft::NodeId, RecordPosition>,
     recover_partial: bool,
     replay: &mut ReplayState,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
+    if !read_segment_header(
+        &mut file,
+        allow_partial,
+        recover_partial,
+        Some(&mut *metrics),
+    )? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file, Some(&mut *stats))? else {
+        let Some(body) = read_record_body(&mut file, Some(&mut *metrics))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
-                stats.replay_truncated();
+                metrics.replay_truncated();
                 if recover_partial {
                     file.set_len(record_start)?;
                     file.seek(SeekFrom::Start(record_start))?;
@@ -1359,7 +1376,7 @@ fn replay_segment(
             let node_record = decode_node_record(&body)?;
             let record_kind = node_record.record.metric_kind();
             replay.apply(node_record)?;
-            stats.record_replayed(record_kind, frame_len_from_body(&body)?);
+            metrics.record_replayed(record_kind, frame_len_from_body(&body)?);
         }
     }
 
@@ -1373,25 +1390,30 @@ fn replay_node_segment(
     checkpoint_position: Option<RecordPosition>,
     recover_partial: bool,
     state: &mut NodeState,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(recover_partial && allow_partial)
         .open(&segment.path)?;
-    if !read_segment_header(&mut file, allow_partial, recover_partial, Some(&mut *stats))? {
+    if !read_segment_header(
+        &mut file,
+        allow_partial,
+        recover_partial,
+        Some(&mut *metrics),
+    )? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
 
     loop {
         let record_start = file.stream_position()?;
-        let Some(body) = read_record_body(&mut file, Some(&mut *stats))? else {
+        let Some(body) = read_record_body(&mut file, Some(&mut *metrics))? else {
             if record_start == file_len {
                 break;
             }
             if allow_partial {
-                stats.replay_truncated();
+                metrics.replay_truncated();
                 if recover_partial {
                     file.set_len(record_start)?;
                     file.seek(SeekFrom::Start(record_start))?;
@@ -1412,7 +1434,7 @@ fn replay_node_segment(
             let node_record = decode_node_record(&body)?;
             let record_kind = node_record.record.metric_kind();
             apply_record_to_state(state, node_record.record)?;
-            stats.record_replayed(record_kind, frame_len_from_body(&body)?);
+            metrics.record_replayed(record_kind, frame_len_from_body(&body)?);
         }
     }
 
@@ -1422,20 +1444,20 @@ fn replay_node_segment(
 fn scan_segment(
     path: &Path,
     allow_partial: bool,
-    stats: &mut StorageStatsCounters,
+    metrics: &mut StorageMetricsCounters,
 ) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(allow_partial)
         .open(path)?;
-    if !read_segment_header(&mut file, allow_partial, true, Some(stats))? {
+    if !read_segment_header(&mut file, allow_partial, true, Some(metrics))? {
         return Ok(());
     }
     let file_len = file.metadata()?.len();
 
     loop {
         let record_start = file.stream_position()?;
-        if scan_record_frame(&mut file, stats)?.is_some() {
+        if scan_record_frame(&mut file, metrics)?.is_some() {
             continue;
         }
 
@@ -1443,7 +1465,7 @@ fn scan_segment(
             break;
         }
         if allow_partial {
-            stats.replay_truncated();
+            metrics.replay_truncated();
             file.set_len(record_start)?;
             file.seek(SeekFrom::Start(record_start))?;
             break;

@@ -1,42 +1,42 @@
-use sukari::{OperationKindStats, RecordKindStats, RejectedOperationStats, StorageStats};
+use sukari::{OperationKindMetrics, RecordKindMetrics, RejectedOperationMetrics, StorageMetrics};
 
 #[test]
-fn record_kind_stats_displays_json() {
-    let stats = record_kind_stats(1, 2, 3, 4);
+fn record_kind_metrics_displays_json() {
+    let metrics = record_kind_metrics(1, 2, 3, 4);
 
     assert_eq!(
-        stats.to_string(),
+        metrics.to_string(),
         r#"{"current_term":1,"voted_for":2,"log_append":3,"snapshot_checkpoint":4}"#
     );
     assert_eq!(
-        nojson::json(|f| f.value(stats)).to_string(),
-        stats.to_string()
+        nojson::json(|f| f.value(metrics)).to_string(),
+        metrics.to_string()
     );
 }
 
 #[test]
-fn operation_kind_stats_displays_json() {
-    let stats = operation_kind_stats(1, 2, 3, 4, 5, 6);
+fn operation_kind_metrics_displays_json() {
+    let metrics = operation_kind_metrics(1, 2, 3, 4, 5, 6);
 
     assert_eq!(
-        stats.to_string(),
+        metrics.to_string(),
         r#"{"load":1,"save_current_term":2,"save_voted_for":3,"append_entries":4,"save_snapshot":5,"remove_node":6}"#
     );
     assert_eq!(
-        nojson::json(|f| f.value(stats)).to_string(),
-        stats.to_string()
+        nojson::json(|f| f.value(metrics)).to_string(),
+        metrics.to_string()
     );
 }
 
 #[test]
-fn rejected_operation_stats_displays_json() {
-    let stats = RejectedOperationStats {
-        unknown_nodes: operation_kind_stats(1, 2, 3, 4, 5, 6),
-        removed_nodes: operation_kind_stats(7, 8, 9, 10, 11, 12),
+fn rejected_operation_metrics_displays_json() {
+    let metrics = RejectedOperationMetrics {
+        unknown_nodes: operation_kind_metrics(1, 2, 3, 4, 5, 6),
+        removed_nodes: operation_kind_metrics(7, 8, 9, 10, 11, 12),
     };
 
     assert_eq!(
-        stats.to_string(),
+        metrics.to_string(),
         concat!(
             r#"{"unknown_nodes":{"load":1,"save_current_term":2,"#,
             r#""save_voted_for":3,"append_entries":4,"save_snapshot":5,"remove_node":6},"#,
@@ -45,18 +45,18 @@ fn rejected_operation_stats_displays_json() {
         )
     );
     assert_eq!(
-        nojson::json(|f| f.value(&stats)).to_string(),
-        stats.to_string()
+        nojson::json(|f| f.value(&metrics)).to_string(),
+        metrics.to_string()
     );
 }
 
 #[test]
-fn storage_stats_displays_json() {
-    let stats = StorageStats {
-        records_written: record_kind_stats(1, 2, 3, 4),
-        bytes_written: record_kind_stats(5, 6, 7, 8),
-        records_replayed: record_kind_stats(9, 10, 11, 12),
-        bytes_replayed: record_kind_stats(13, 14, 15, 16),
+fn storage_metrics_displays_json() {
+    let metrics = StorageMetrics {
+        records_written: record_kind_metrics(1, 2, 3, 4),
+        bytes_written: record_kind_metrics(5, 6, 7, 8),
+        records_replayed: record_kind_metrics(9, 10, 11, 12),
+        bytes_replayed: record_kind_metrics(13, 14, 15, 16),
         segment_rotations: 17,
         syncs: 18,
         durable_syncs: 19,
@@ -64,9 +64,9 @@ fn storage_stats_displays_json() {
         checksum_failures: 21,
         nodes_created: 22,
         nodes_removed: 23,
-        rejected_operations: RejectedOperationStats {
-            unknown_nodes: operation_kind_stats(24, 25, 26, 27, 28, 29),
-            removed_nodes: operation_kind_stats(30, 31, 32, 33, 34, 35),
+        rejected_operations: RejectedOperationMetrics {
+            unknown_nodes: operation_kind_metrics(24, 25, 26, 27, 28, 29),
+            removed_nodes: operation_kind_metrics(30, 31, 32, 33, 34, 35),
         },
         snapshot_checkpoints_saved: 36,
         gc_runs: 37,
@@ -81,7 +81,7 @@ fn storage_stats_displays_json() {
     };
 
     assert_eq!(
-        stats.to_string(),
+        metrics.to_string(),
         concat!(
             r#"{"records_written":{"current_term":1,"voted_for":2,"log_append":3,"snapshot_checkpoint":4},"#,
             r#""bytes_written":{"current_term":5,"voted_for":6,"log_append":7,"snapshot_checkpoint":8},"#,
@@ -100,18 +100,18 @@ fn storage_stats_displays_json() {
         )
     );
     assert_eq!(
-        nojson::json(|f| f.value(&stats)).to_string(),
-        stats.to_string()
+        nojson::json(|f| f.value(&metrics)).to_string(),
+        metrics.to_string()
     );
 }
 
-fn record_kind_stats(
+fn record_kind_metrics(
     current_term: u64,
     voted_for: u64,
     log_append: u64,
     snapshot_checkpoint: u64,
-) -> RecordKindStats {
-    RecordKindStats {
+) -> RecordKindMetrics {
+    RecordKindMetrics {
         current_term,
         voted_for,
         log_append,
@@ -119,15 +119,15 @@ fn record_kind_stats(
     }
 }
 
-fn operation_kind_stats(
+fn operation_kind_metrics(
     load: u64,
     save_current_term: u64,
     save_voted_for: u64,
     append_entries: u64,
     save_snapshot: u64,
     remove_node: u64,
-) -> OperationKindStats {
-    OperationKindStats {
+) -> OperationKindMetrics {
+    OperationKindMetrics {
         load,
         save_current_term,
         save_voted_for,

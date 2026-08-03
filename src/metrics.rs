@@ -1,21 +1,21 @@
-//! Storage statistics.
+//! Storage metrics.
 
 use core::fmt;
 
 /// Runtime storage counters and gauges.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct StorageStats {
+pub struct StorageMetrics {
     /// Segment records written by record kind.
-    pub records_written: RecordKindStats,
+    pub records_written: RecordKindMetrics,
 
     /// Segment frame bytes written by record kind.
-    pub bytes_written: RecordKindStats,
+    pub bytes_written: RecordKindMetrics,
 
     /// Segment records replayed by record kind.
-    pub records_replayed: RecordKindStats,
+    pub records_replayed: RecordKindMetrics,
 
     /// Segment frame bytes replayed by record kind.
-    pub bytes_replayed: RecordKindStats,
+    pub bytes_replayed: RecordKindMetrics,
 
     /// Number of append segment rotations.
     pub segment_rotations: u64,
@@ -39,7 +39,7 @@ pub struct StorageStats {
     pub nodes_removed: u64,
 
     /// Rejected node operations.
-    pub rejected_operations: RejectedOperationStats,
+    pub rejected_operations: RejectedOperationMetrics,
 
     /// Number of user snapshot checkpoints saved successfully.
     pub snapshot_checkpoints_saved: u64,
@@ -72,7 +72,7 @@ pub struct StorageStats {
     pub unsynced_bytes: u64,
 }
 
-impl nojson::DisplayJson for StorageStats {
+impl nojson::DisplayJson for StorageMetrics {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
         f.object(|f| {
             f.member("records_written", self.records_written)?;
@@ -107,15 +107,15 @@ impl nojson::DisplayJson for StorageStats {
     }
 }
 
-impl fmt::Display for StorageStats {
+impl fmt::Display for StorageMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         display_json(self, f)
     }
 }
 
-/// Statistics keyed by segment record kind.
+/// Metrics keyed by segment record kind.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RecordKindStats {
+pub struct RecordKindMetrics {
     /// Current-term records.
     pub current_term: u64,
 
@@ -129,7 +129,7 @@ pub struct RecordKindStats {
     pub snapshot_checkpoint: u64,
 }
 
-impl nojson::DisplayJson for RecordKindStats {
+impl nojson::DisplayJson for RecordKindMetrics {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
         f.object(|f| {
             f.member("current_term", self.current_term)?;
@@ -140,23 +140,23 @@ impl nojson::DisplayJson for RecordKindStats {
     }
 }
 
-impl fmt::Display for RecordKindStats {
+impl fmt::Display for RecordKindMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         display_json(self, f)
     }
 }
 
-/// Rejected operation statistics.
+/// Rejected operation metrics.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RejectedOperationStats {
+pub struct RejectedOperationMetrics {
     /// Operations rejected because the node has not been created.
-    pub unknown_nodes: OperationKindStats,
+    pub unknown_nodes: OperationKindMetrics,
 
     /// Operations rejected because the node has been removed.
-    pub removed_nodes: OperationKindStats,
+    pub removed_nodes: OperationKindMetrics,
 }
 
-impl nojson::DisplayJson for RejectedOperationStats {
+impl nojson::DisplayJson for RejectedOperationMetrics {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
         f.object(|f| {
             f.member("unknown_nodes", self.unknown_nodes)?;
@@ -165,15 +165,15 @@ impl nojson::DisplayJson for RejectedOperationStats {
     }
 }
 
-impl fmt::Display for RejectedOperationStats {
+impl fmt::Display for RejectedOperationMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         display_json(self, f)
     }
 }
 
-/// Statistics keyed by storage operation kind.
+/// Metrics keyed by storage operation kind.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct OperationKindStats {
+pub struct OperationKindMetrics {
     /// `StorageEngine::load` rejections.
     pub load: u64,
 
@@ -193,7 +193,7 @@ pub struct OperationKindStats {
     pub remove_node: u64,
 }
 
-impl nojson::DisplayJson for OperationKindStats {
+impl nojson::DisplayJson for OperationKindMetrics {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> fmt::Result {
         f.object(|f| {
             f.member("load", self.load)?;
@@ -206,72 +206,72 @@ impl nojson::DisplayJson for OperationKindStats {
     }
 }
 
-impl fmt::Display for OperationKindStats {
+impl fmt::Display for OperationKindMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         display_json(self, f)
     }
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct StorageStatsCounters {
-    stats: StorageStats,
+pub(crate) struct StorageMetricsCounters {
+    metrics: StorageMetrics,
 }
 
-impl StorageStatsCounters {
-    pub(crate) fn as_ref(&self) -> &StorageStats {
-        &self.stats
+impl StorageMetricsCounters {
+    pub(crate) fn as_ref(&self) -> &StorageMetrics {
+        &self.metrics
     }
 
     pub(crate) fn record_written(&mut self, kind: RecordKindMetric, bytes: u64) {
-        self.stats.records_written.increment(kind, 1);
-        self.stats.bytes_written.increment(kind, bytes);
-        increment(&mut self.stats.unsynced_records, 1);
-        increment(&mut self.stats.unsynced_bytes, bytes);
+        self.metrics.records_written.increment(kind, 1);
+        self.metrics.bytes_written.increment(kind, bytes);
+        increment(&mut self.metrics.unsynced_records, 1);
+        increment(&mut self.metrics.unsynced_bytes, bytes);
     }
 
     pub(crate) fn record_replayed(&mut self, kind: RecordKindMetric, bytes: u64) {
-        self.stats.records_replayed.increment(kind, 1);
-        self.stats.bytes_replayed.increment(kind, bytes);
+        self.metrics.records_replayed.increment(kind, 1);
+        self.metrics.bytes_replayed.increment(kind, bytes);
     }
 
     pub(crate) fn segment_opened(&mut self, segment_id: u64, segment_len: u64) {
-        self.stats.active_append_segment_id = segment_id;
-        self.stats.active_append_segment_len_bytes = segment_len;
+        self.metrics.active_append_segment_id = segment_id;
+        self.metrics.active_append_segment_len_bytes = segment_len;
     }
 
     pub(crate) fn segment_written(&mut self, segment_len: u64) {
-        self.stats.active_append_segment_len_bytes = segment_len;
+        self.metrics.active_append_segment_len_bytes = segment_len;
     }
 
     pub(crate) fn segment_rotated(&mut self, segment_id: u64, segment_len: u64) {
-        increment(&mut self.stats.segment_rotations, 1);
+        increment(&mut self.metrics.segment_rotations, 1);
         self.segment_opened(segment_id, segment_len);
     }
 
     pub(crate) fn sync_requested(&mut self) {
-        increment(&mut self.stats.syncs, 1);
+        increment(&mut self.metrics.syncs, 1);
     }
 
     pub(crate) fn segment_synced(&mut self) {
-        increment(&mut self.stats.durable_syncs, 1);
-        self.stats.unsynced_records = 0;
-        self.stats.unsynced_bytes = 0;
+        increment(&mut self.metrics.durable_syncs, 1);
+        self.metrics.unsynced_records = 0;
+        self.metrics.unsynced_bytes = 0;
     }
 
     pub(crate) fn replay_truncated(&mut self) {
-        increment(&mut self.stats.replay_truncations, 1);
+        increment(&mut self.metrics.replay_truncations, 1);
     }
 
     pub(crate) fn checksum_failed(&mut self) {
-        increment(&mut self.stats.checksum_failures, 1);
+        increment(&mut self.metrics.checksum_failures, 1);
     }
 
     pub(crate) fn node_created(&mut self) {
-        increment(&mut self.stats.nodes_created, 1);
+        increment(&mut self.metrics.nodes_created, 1);
     }
 
     pub(crate) fn node_removed(&mut self) {
-        increment(&mut self.stats.nodes_removed, 1);
+        increment(&mut self.metrics.nodes_removed, 1);
     }
 
     pub(crate) fn rejected_operation(
@@ -279,41 +279,41 @@ impl StorageStatsCounters {
         operation: StorageOperationKind,
         error: NodeAccessErrorKind,
     ) {
-        self.stats.rejected_operations.increment(operation, error);
+        self.metrics.rejected_operations.increment(operation, error);
     }
 
     pub(crate) fn snapshot_checkpoint_saved(&mut self) {
-        increment(&mut self.stats.snapshot_checkpoints_saved, 1);
+        increment(&mut self.metrics.snapshot_checkpoints_saved, 1);
     }
 
     pub(crate) fn gc_ran(&mut self) {
-        increment(&mut self.stats.gc_runs, 1);
+        increment(&mut self.metrics.gc_runs, 1);
     }
 
     pub(crate) fn gc_deleted_segments(&mut self, count: u64) {
-        increment(&mut self.stats.gc_segments_deleted, count);
+        increment(&mut self.metrics.gc_segments_deleted, count);
     }
 
     pub(crate) fn registry_loaded(&mut self, active_nodes: u64, removed_nodes: u64) {
-        self.stats.active_nodes = active_nodes;
-        self.stats.removed_nodes = removed_nodes;
+        self.metrics.active_nodes = active_nodes;
+        self.metrics.removed_nodes = removed_nodes;
     }
 
     pub(crate) fn checkpoint_index_loaded(&mut self, nodes: u64) {
-        self.stats.checkpoint_index_nodes = nodes;
+        self.metrics.checkpoint_index_nodes = nodes;
     }
 
     pub(crate) fn node_counts_changed(&mut self, active_nodes: u64, removed_nodes: u64) {
-        self.stats.active_nodes = active_nodes;
-        self.stats.removed_nodes = removed_nodes;
+        self.metrics.active_nodes = active_nodes;
+        self.metrics.removed_nodes = removed_nodes;
     }
 
     pub(crate) fn checkpoint_index_changed(&mut self, nodes: u64) {
-        self.stats.checkpoint_index_nodes = nodes;
+        self.metrics.checkpoint_index_nodes = nodes;
     }
 }
 
-impl RecordKindStats {
+impl RecordKindMetrics {
     fn increment(&mut self, kind: RecordKindMetric, value: u64) {
         match kind {
             RecordKindMetric::CurrentTerm => increment(&mut self.current_term, value),
@@ -326,7 +326,7 @@ impl RecordKindStats {
     }
 }
 
-impl RejectedOperationStats {
+impl RejectedOperationMetrics {
     fn increment(&mut self, operation: StorageOperationKind, error: NodeAccessErrorKind) {
         match error {
             NodeAccessErrorKind::UnknownNode => self.unknown_nodes.increment(operation),
@@ -335,7 +335,7 @@ impl RejectedOperationStats {
     }
 }
 
-impl OperationKindStats {
+impl OperationKindMetrics {
     fn increment(&mut self, operation: StorageOperationKind) {
         match operation {
             StorageOperationKind::Load => increment(&mut self.load, 1),
