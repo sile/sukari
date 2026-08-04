@@ -31,6 +31,7 @@
 //! `checkpoints.json` are synchronized by the storage engine.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod bytes;
 mod codec;
