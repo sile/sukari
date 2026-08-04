@@ -36,6 +36,7 @@
 mod bytes;
 mod codec;
 mod crc32c;
+pub mod docs;
 mod error;
 mod metrics;
 mod registry;

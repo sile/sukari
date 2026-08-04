@@ -216,18 +216,15 @@ one node and declares that earlier records for that node are no longer needed.
 The API shape is:
 
 ```rust
-pub struct SnapshotCheckpoint {
-    pub current_term: noraft::Term,
-    pub voted_for: Option<noraft::NodeId>,
-    pub snapshot: Snapshot,
-    pub suffix: LogAppend,
-}
+use sukari::{LogAppend, Snapshot, SnapshotCheckpoint};
 
-pub fn save_snapshot(
-    &mut self,
+fn save_snapshot(
+    storage: &mut sukari::StorageEngine,
     node_id: noraft::NodeId,
     checkpoint: SnapshotCheckpoint,
-) -> io::Result<()>;
+) -> std::io::Result<()> {
+    storage.save_snapshot(node_id, checkpoint)
+}
 ```
 
 The checkpoint record contains the current term, voted-for node, snapshot, and
