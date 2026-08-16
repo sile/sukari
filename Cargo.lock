@@ -100,9 +100,9 @@ checksum = "e75dfcef0ca5529a58a350e6b80783c98521a70f73fb1c4f0d4b661ba892d766"
 
 [[package]]
 name = "noraft"
-version = "0.6.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02572d4081010464d13ba6f76a896d9464b634b504f6340aa959341f053e00a2"
+checksum = "905479cec386fe071c82a85f27968b90ff52c80227cf004fe7ec996defabb913"
 
 [[package]]
 name = "num-traits"

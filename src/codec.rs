@@ -254,6 +254,14 @@ fn decode_log_entries(decoder: &mut Decoder<'_>) -> io::Result<noraft::LogEntrie
     let prev_position = decode_log_position(decoder)?;
     let len = decode_count(decoder, "too many log entries")?;
 
+    if prev_position
+        .index
+        .checked_add(noraft::LogIndex::new(u64::from(len)))
+        .is_none()
+    {
+        return Err(invalid_data("log entries overflow the log index space"));
+    }
+
     let mut entries = noraft::LogEntries::new(prev_position);
     for _ in 0..len {
         entries.push(decode_log_entry(decoder)?);
