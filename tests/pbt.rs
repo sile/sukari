@@ -1,10 +1,12 @@
+//! Property-based tests for the `StorageEngine` replay round trip.
+
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use proptest::prelude::*;
 use sukari::{
     Bytes, CommandPayload, LogAppend, NodeMetadata, NodeState, Snapshot, SnapshotCheckpoint,
     StorageEngine,
@@ -81,90 +83,122 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        match std::fs::remove_dir_all(&self.path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
-        }
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-fn generated_config() -> impl Strategy<Value = GeneratedConfig> {
-    (
-        proptest::collection::vec(1u64..=5, 0..=4),
-        proptest::collection::vec(1u64..=5, 0..=4),
-        proptest::collection::vec(1u64..=5, 0..=4),
+// Include 1 (rotation on every record) among the boundaries and let the interior
+// distribution reach up to 512 so both frequent-rotation and no-rotation cases
+// are exercised.
+fn sample_max_segment_len(ctx: &mut noprop::TestCaseContext) -> u64 {
+    noprop::sample_with_boundaries(
+        ctx,
+        &[1u64, 2, 128, 512],
+        noprop::Ratio::one_nth(4),
+        |ctx| noprop::sample_u64_in(ctx, 1..=512),
     )
-        .prop_map(|(voters, new_voters, non_voters)| GeneratedConfig {
-            voters,
-            new_voters,
-            non_voters,
-        })
 }
 
-fn generated_entry() -> impl Strategy<Value = GeneratedEntry> {
-    prop_oneof![
-        (0u64..=8).prop_map(GeneratedEntry::Term),
-        generated_config().prop_map(GeneratedEntry::ClusterConfig),
-        (any::<u8>(), proptest::collection::vec(any::<u8>(), 0..=24))
-            .prop_map(|(tag, payload)| GeneratedEntry::Command { tag, payload }),
-    ]
+fn sample_generated_config(ctx: &mut noprop::TestCaseContext) -> GeneratedConfig {
+    GeneratedConfig {
+        voters: sample_u64_vec(ctx, 0..=4, 1..=5),
+        new_voters: sample_u64_vec(ctx, 0..=4, 1..=5),
+        non_voters: sample_u64_vec(ctx, 0..=4, 1..=5),
+    }
 }
 
-fn operation() -> impl Strategy<Value = Operation> {
-    prop_oneof![
-        (0u64..=16).prop_map(Operation::CurrentTerm),
-        proptest::option::of(1u64..=5).prop_map(Operation::VotedFor),
-        (
-            0usize..=32,
-            proptest::collection::vec(generated_entry(), 0..=6),
-        )
-            .prop_map(|(anchor, entries)| Operation::Append { anchor, entries }),
-        (
-            0u64..=16,
-            proptest::option::of(1u64..=5),
-            0usize..=32,
-            generated_config(),
-            proptest::collection::vec(any::<u8>(), 0..=32),
-            proptest::collection::vec(generated_entry(), 0..=6),
-        )
-            .prop_map(
-                |(
-                    current_term,
-                    voted_for,
-                    snapshot_position,
-                    snapshot_config,
-                    snapshot_data,
-                    suffix_entries,
-                )| Operation::SnapshotCheckpoint {
-                    current_term,
-                    voted_for,
-                    snapshot_position,
-                    snapshot_config,
-                    snapshot_data,
-                    suffix_entries,
-                },
-            ),
-    ]
+fn sample_u64_vec(
+    ctx: &mut noprop::TestCaseContext,
+    len_range: std::ops::RangeInclusive<usize>,
+    value_range: std::ops::RangeInclusive<u64>,
+) -> Vec<u64> {
+    let len = noprop::sample_usize_in(ctx, len_range);
+    (0..len)
+        .map(|_| noprop::sample_u64_in(ctx, value_range.clone()))
+        .collect()
 }
 
-fn operations() -> impl Strategy<Value = Vec<Operation>> {
-    proptest::collection::vec(operation(), 0..=32)
+fn sample_u8_vec(
+    ctx: &mut noprop::TestCaseContext,
+    len_range: std::ops::RangeInclusive<usize>,
+) -> Vec<u8> {
+    let len = noprop::sample_usize_in(ctx, len_range);
+    (0..len).map(|_| noprop::sample_u8(ctx)).collect()
 }
 
-fn multi_node_operation() -> impl Strategy<Value = MultiNodeOperation> {
-    prop_oneof![
-        1 => (1u64..=4).prop_map(MultiNodeOperation::Create),
-        1 => (0usize..=8).prop_map(MultiNodeOperation::Remove),
-        1 => Just(MultiNodeOperation::Sync),
-        8 => (0usize..=8, operation()).prop_map(|(node, operation)| {
-            MultiNodeOperation::Node { node, operation }
-        }),
-    ]
+fn sample_generated_entry(ctx: &mut noprop::TestCaseContext) -> GeneratedEntry {
+    match noprop::sample_weighted_index(ctx, &[1, 1, 1]) {
+        0 => GeneratedEntry::Term(noprop::sample_u64_in(ctx, 0..=8)),
+        1 => GeneratedEntry::ClusterConfig(sample_generated_config(ctx)),
+        _ => GeneratedEntry::Command {
+            tag: noprop::sample_u8(ctx),
+            payload: sample_u8_vec(ctx, 0..=24),
+        },
+    }
 }
 
-fn multi_node_operations() -> impl Strategy<Value = Vec<MultiNodeOperation>> {
-    proptest::collection::vec(multi_node_operation(), 0..=32)
+fn sample_generated_entries(ctx: &mut noprop::TestCaseContext) -> Vec<GeneratedEntry> {
+    let len = noprop::sample_usize_in(ctx, 0..=6);
+    (0..len).map(|_| sample_generated_entry(ctx)).collect()
+}
+
+fn sample_optional_voted_for(ctx: &mut noprop::TestCaseContext) -> Option<u64> {
+    if noprop::sample_bool(ctx) {
+        Some(noprop::sample_u64_in(ctx, 1..=5))
+    } else {
+        None
+    }
+}
+
+fn sample_operation(ctx: &mut noprop::TestCaseContext) -> Operation {
+    match noprop::sample_weighted_index(ctx, &[1, 1, 1, 1]) {
+        0 => Operation::CurrentTerm(noprop::sample_u64_in(ctx, 0..=16)),
+        1 => Operation::VotedFor(sample_optional_voted_for(ctx)),
+        2 => Operation::Append {
+            anchor: noprop::sample_usize_in(ctx, 0..=32),
+            entries: sample_generated_entries(ctx),
+        },
+        _ => Operation::SnapshotCheckpoint {
+            current_term: noprop::sample_u64_in(ctx, 0..=16),
+            voted_for: sample_optional_voted_for(ctx),
+            snapshot_position: noprop::sample_usize_in(ctx, 0..=32),
+            snapshot_config: sample_generated_config(ctx),
+            snapshot_data: sample_u8_vec(ctx, 0..=32),
+            suffix_entries: sample_generated_entries(ctx),
+        },
+    }
+}
+
+// Boundaries 0, 1, 32 make sure empty, single-operation, and full-length runs
+// are all covered explicitly.
+fn sample_operations(ctx: &mut noprop::TestCaseContext) -> Vec<Operation> {
+    let len =
+        noprop::sample_with_boundaries(ctx, &[0usize, 1, 32], noprop::Ratio::one_nth(4), |ctx| {
+            noprop::sample_usize_in(ctx, 0..=32)
+        });
+    (0..len).map(|_| sample_operation(ctx)).collect()
+}
+
+fn sample_multi_node_operation(ctx: &mut noprop::TestCaseContext) -> MultiNodeOperation {
+    // Weight Node-scoped operations heavily so cases mostly exercise state
+    // transitions of existing nodes rather than churning the node set.
+    match noprop::sample_weighted_index(ctx, &[1, 1, 1, 8]) {
+        0 => MultiNodeOperation::Create(noprop::sample_u64_in(ctx, 1..=4)),
+        1 => MultiNodeOperation::Remove(noprop::sample_usize_in(ctx, 0..=8)),
+        2 => MultiNodeOperation::Sync,
+        _ => MultiNodeOperation::Node {
+            node: noprop::sample_usize_in(ctx, 0..=8),
+            operation: sample_operation(ctx),
+        },
+    }
+}
+
+fn sample_multi_node_operations(ctx: &mut noprop::TestCaseContext) -> Vec<MultiNodeOperation> {
+    let len =
+        noprop::sample_with_boundaries(ctx, &[0usize, 1, 32], noprop::Ratio::one_nth(4), |ctx| {
+            noprop::sample_usize_in(ctx, 0..=32)
+        });
+    (0..len).map(|_| sample_multi_node_operation(ctx)).collect()
 }
 
 fn cluster_config(config: GeneratedConfig) -> noraft::ClusterConfig {
@@ -241,10 +275,11 @@ fn initial_state() -> NodeState {
     }
 }
 
-fn apply_append_to_expected(state: &mut NodeState, append: &LogAppend) -> Result<(), String> {
-    if !state.log.append_suffix(append.entries()) {
-        return Err("append anchor does not exist in expected log".to_owned());
-    }
+fn apply_append_to_expected(state: &mut NodeState, append: &LogAppend) {
+    assert!(
+        state.log.append_suffix(append.entries()),
+        "append anchor does not exist in expected log"
+    );
 
     let prev_index = append.entries().prev_position().index;
     state
@@ -253,7 +288,6 @@ fn apply_append_to_expected(state: &mut NodeState, append: &LogAppend) -> Result
     state
         .command_payloads
         .extend(append.command_payloads().clone());
-    Ok(())
 }
 
 fn apply_operation(engine: &mut StorageEngine, expected: &mut NodeState, operation: Operation) {
@@ -286,7 +320,7 @@ fn apply_node_operation(
             engine
                 .append_entries(node_id, append.clone())
                 .expect("append should be stored");
-            apply_append_to_expected(expected, &append).expect("generated append should apply");
+            apply_append_to_expected(expected, &append);
         }
         Operation::SnapshotCheckpoint {
             current_term,
@@ -368,20 +402,24 @@ fn apply_multi_node_operation(
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+#[test]
+fn storage_replay_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("SUKARI_PBT_SEED")?;
 
-    #[test]
-    fn storage_replay_roundtrip(
-        max_segment_len in 1u64..=512,
-        operations in operations(),
-    ) {
+    // Independent coverage gates so any change to the search space that
+    // silently drops one of these regions is caught up front.
+    let cases_with_rotation = Cell::new(0usize);
+    let cases_with_extra_snapshot = Cell::new(0usize);
+    let cases_with_non_empty_log = Cell::new(0usize);
+
+    let mut runner = noprop::Runner::new(seed);
+    runner.run(128, |ctx| {
+        let max_segment_len = sample_max_segment_len(ctx);
+        let operations = sample_operations(ctx);
+
         let dir = TempDir::new("sukari-pbt-storage-replay");
-        let mut engine = StorageEngine::with_max_segment_len(
-            dir.path(),
-            max_segment_len,
-        )
-        .expect("storage should open");
+        let mut engine = StorageEngine::with_max_segment_len(dir.path(), max_segment_len)
+            .expect("storage should open");
         engine
             .create_node(NODE_ID, NodeMetadata::default())
             .expect("node should be created");
@@ -390,33 +428,65 @@ proptest! {
         for operation in operations {
             apply_operation(&mut engine, &mut expected, operation);
         }
+
+        let write_metrics = engine.metrics().clone();
         drop(engine);
 
-        let mut engine =
-            StorageEngine::new(dir.path()).expect("storage should reopen");
+        let mut engine = StorageEngine::new(dir.path()).expect("storage should reopen");
         let loaded = engine.load(NODE_ID).expect("node state should load");
-        prop_assert_eq!(&loaded, &expected);
+        assert_eq!(loaded, expected);
 
         let mut all = engine.load_all().expect("all states should load");
-        prop_assert_eq!(all.remove(&NODE_ID), Some(expected));
-        prop_assert!(all.is_empty());
-    }
+        assert_eq!(all.remove(&NODE_ID), Some(expected.clone()));
+        assert!(all.is_empty());
+
+        if write_metrics.segment_rotations > 0 {
+            cases_with_rotation.set(cases_with_rotation.get() + 1);
+        }
+        // create_node writes one initial checkpoint, so an extra snapshot save
+        // is signaled by seeing more than one checkpoint for a single node.
+        if write_metrics.snapshot_checkpoints_saved > 1 {
+            cases_with_extra_snapshot.set(cases_with_extra_snapshot.get() + 1);
+        }
+        if !expected.log.entries().is_empty() {
+            cases_with_non_empty_log.set(cases_with_non_empty_log.get() + 1);
+        }
+
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_rotation.get() > 0,
+        "no case exercised segment rotation\n{runner}"
+    );
+    assert!(
+        cases_with_extra_snapshot.get() > 0,
+        "no case saved an additional snapshot checkpoint\n{runner}"
+    );
+    assert!(
+        cases_with_non_empty_log.get() > 0,
+        "no case ended with a non-empty log\n{runner}"
+    );
+    Ok(())
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+#[test]
+fn multi_node_storage_replay_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("SUKARI_PBT_SEED")?;
 
-    #[test]
-    fn multi_node_storage_replay_roundtrip(
-        max_segment_len in 1u64..=512,
-        operations in multi_node_operations(),
-    ) {
+    let cases_with_multiple_active_nodes = Cell::new(0usize);
+    let cases_with_removed_node = Cell::new(0usize);
+    let cases_with_rotation = Cell::new(0usize);
+    let cases_with_extra_snapshot = Cell::new(0usize);
+
+    let mut runner = noprop::Runner::new(seed);
+    runner.run(64, |ctx| {
+        let max_segment_len = sample_max_segment_len(ctx);
+        let operations = sample_multi_node_operations(ctx);
+
         let dir = TempDir::new("sukari-pbt-multi-node-storage-replay");
-        let mut engine = StorageEngine::with_max_segment_len(
-            dir.path(),
-            max_segment_len,
-        )
-        .expect("storage should open");
+        let mut engine = StorageEngine::with_max_segment_len(dir.path(), max_segment_len)
+            .expect("storage should open");
 
         let initial_node = NODE_ID;
         engine
@@ -428,16 +498,52 @@ proptest! {
         for operation in operations {
             apply_multi_node_operation(&mut engine, &mut active, &mut created, operation);
         }
+
+        let write_metrics = engine.metrics().clone();
         drop(engine);
 
-        let mut engine =
-            StorageEngine::new(dir.path()).expect("storage should reopen");
+        let mut engine = StorageEngine::new(dir.path()).expect("storage should reopen");
         for (node_id, expected) in &active {
             let loaded = engine.load(*node_id).expect("node state should load");
-            prop_assert_eq!(&loaded, expected);
+            assert_eq!(&loaded, expected);
         }
 
         let all = engine.load_all().expect("all states should load");
-        prop_assert_eq!(all, active);
-    }
+        assert_eq!(all, active);
+
+        if active.len() >= 2 {
+            cases_with_multiple_active_nodes.set(cases_with_multiple_active_nodes.get() + 1);
+        }
+        if created.len() > active.len() {
+            cases_with_removed_node.set(cases_with_removed_node.get() + 1);
+        }
+        if write_metrics.segment_rotations > 0 {
+            cases_with_rotation.set(cases_with_rotation.get() + 1);
+        }
+        // create_node writes one initial checkpoint per node, so subtract that
+        // baseline before deciding whether an extra snapshot was saved.
+        if write_metrics.snapshot_checkpoints_saved > created.len() as u64 {
+            cases_with_extra_snapshot.set(cases_with_extra_snapshot.get() + 1);
+        }
+
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_multiple_active_nodes.get() > 0,
+        "no case ended with two or more active nodes\n{runner}"
+    );
+    assert!(
+        cases_with_removed_node.get() > 0,
+        "no case removed a node\n{runner}"
+    );
+    assert!(
+        cases_with_rotation.get() > 0,
+        "no case exercised segment rotation\n{runner}"
+    );
+    assert!(
+        cases_with_extra_snapshot.get() > 0,
+        "no case saved an additional snapshot checkpoint\n{runner}"
+    );
+    Ok(())
 }

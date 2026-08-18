@@ -12,13 +12,11 @@ categories = ["algorithms", "database-implementations"]
 keywords = ["raft", "storage", "wal", "multi-raft"]
 
 [workspace]
-members = ["pbt"]
 exclude = ["fuzz"]
 
-[workspace.dependencies]
+[dependencies]
 noraft = "0.7"
 nojson = "0.3"
 
-[dependencies]
-noraft = { workspace = true }
-nojson = { workspace = true }
+[dev-dependencies]
+noprop = "0.2"
