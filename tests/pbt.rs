@@ -567,10 +567,12 @@ fn storage_persists_across_reopens() -> noprop::TestResult {
         let max_segment_len = sample_max_segment_len(ctx);
         // Boundaries 1, 2, 4 make sure single-phase (baseline) and true
         // multi-phase runs are both explored.
-        let phase_count =
-            noprop::sample_with_boundaries(ctx, &[1usize, 2, 4], noprop::Ratio::one_nth(3), |ctx| {
-                noprop::sample_usize_in(ctx, 1..=4)
-            });
+        let phase_count = noprop::sample_with_boundaries(
+            ctx,
+            &[1usize, 2, 4],
+            noprop::Ratio::one_nth(3),
+            |ctx| noprop::sample_usize_in(ctx, 1..=4),
+        );
         let phases: Vec<Vec<Operation>> =
             (0..phase_count).map(|_| sample_operations(ctx)).collect();
 
