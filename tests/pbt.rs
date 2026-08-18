@@ -547,3 +547,105 @@ fn multi_node_storage_replay_roundtrip() -> noprop::TestResult {
     );
     Ok(())
 }
+
+// Exercise close/reopen boundaries mid-workload: split the operation stream
+// into multiple phases, and between each phase drop the engine and open a
+// fresh one against the same directory. Verifies that reopens preserve state
+// and that continued writes on top of a replayed engine remain consistent
+// with the model.
+#[test]
+fn storage_persists_across_reopens() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("SUKARI_PBT_SEED")?;
+
+    let cases_multi_phase = Cell::new(0usize);
+    let cases_multi_phase_with_rotation = Cell::new(0usize);
+    let cases_multi_phase_with_extra_snapshot = Cell::new(0usize);
+    let cases_with_non_empty_log = Cell::new(0usize);
+
+    let mut runner = noprop::Runner::new(seed);
+    runner.run(64, |ctx| {
+        let max_segment_len = sample_max_segment_len(ctx);
+        // Boundaries 1, 2, 4 make sure single-phase (baseline) and true
+        // multi-phase runs are both explored.
+        let phase_count =
+            noprop::sample_with_boundaries(ctx, &[1usize, 2, 4], noprop::Ratio::one_nth(3), |ctx| {
+                noprop::sample_usize_in(ctx, 1..=4)
+            });
+        let phases: Vec<Vec<Operation>> =
+            (0..phase_count).map(|_| sample_operations(ctx)).collect();
+
+        let dir = TempDir::new("sukari-pbt-storage-reopen");
+        let mut expected = initial_state();
+        let mut total_rotations = 0u64;
+        let mut total_checkpoints = 0u64;
+        let mut is_first = true;
+
+        for phase in phases {
+            let mut engine = StorageEngine::with_max_segment_len(dir.path(), max_segment_len)
+                .expect("storage should open");
+            if is_first {
+                engine
+                    .create_node(NODE_ID, NodeMetadata::default())
+                    .expect("node should be created");
+                is_first = false;
+            } else {
+                // On reopen, the replayed state must already match what earlier
+                // phases wrote before any new operation runs.
+                let loaded = engine.load(NODE_ID).expect("node state should load");
+                assert_eq!(loaded, expected);
+            }
+
+            for operation in phase {
+                apply_operation(&mut engine, &mut expected, operation);
+            }
+
+            let metrics = engine.metrics();
+            total_rotations += metrics.segment_rotations;
+            total_checkpoints += metrics.snapshot_checkpoints_saved;
+        }
+
+        let mut engine = StorageEngine::new(dir.path()).expect("storage should reopen finally");
+        let loaded = engine.load(NODE_ID).expect("node state should load");
+        assert_eq!(loaded, expected);
+        let mut all = engine.load_all().expect("all states should load");
+        assert_eq!(all.remove(&NODE_ID), Some(expected.clone()));
+        assert!(all.is_empty());
+
+        if phase_count >= 2 {
+            cases_multi_phase.set(cases_multi_phase.get() + 1);
+            if total_rotations > 0 {
+                cases_multi_phase_with_rotation.set(cases_multi_phase_with_rotation.get() + 1);
+            }
+            // The initial checkpoint from create_node accounts for one, so a
+            // total greater than one means at least one user-triggered
+            // snapshot save happened somewhere in the run.
+            if total_checkpoints > 1 {
+                cases_multi_phase_with_extra_snapshot
+                    .set(cases_multi_phase_with_extra_snapshot.get() + 1);
+            }
+        }
+        if !expected.log.entries().is_empty() {
+            cases_with_non_empty_log.set(cases_with_non_empty_log.get() + 1);
+        }
+
+        Ok(())
+    })?;
+
+    assert!(
+        cases_multi_phase.get() > 0,
+        "no case executed more than one phase\n{runner}"
+    );
+    assert!(
+        cases_multi_phase_with_rotation.get() > 0,
+        "no multi-phase case exercised segment rotation\n{runner}"
+    );
+    assert!(
+        cases_multi_phase_with_extra_snapshot.get() > 0,
+        "no multi-phase case saved an additional snapshot checkpoint\n{runner}"
+    );
+    assert!(
+        cases_with_non_empty_log.get() > 0,
+        "no case ended with a non-empty log\n{runner}"
+    );
+    Ok(())
+}
